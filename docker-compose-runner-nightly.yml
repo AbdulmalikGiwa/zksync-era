@@ -10,11 +10,11 @@ services:
       file: docker-compose.yml
       service: postgres
 
-  reth:
+  l1:
     extends:
       file: docker-compose.yml
-      service: reth
+      service: l1
 
 volumes:
   postgres-data:
-  reth-data:
+  l1_data:
