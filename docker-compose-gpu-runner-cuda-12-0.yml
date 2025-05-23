@@ -1,24 +1,20 @@
 version: '3.2'
 services:
-  reth:
+  l1:
     restart: always
-    image: "ghcr.io/paradigmxyz/reth:v1.3.7"
+    build:
+      context: .
+      dockerfile: Dockerfile.l1
+    volumes:
+      - type: bind
+        source: ${HOME}/${COMPOSE_PROJECT_NAME}-data/l1_data
+        target: /db/.syscoin
     ports:
       - 127.0.0.1:8545:8545
-    volumes:
-      - type: volume
-        source: reth-data
-        target: /rethdata
-      - type: bind
-        source: ./etc/reth/chaindata
-        target: /chaindata
-
-    command: node --dev --datadir /rethdata --http --http.addr 0.0.0.0 --http.port 8545 --http.corsdomain "*" --dev.block-time 300ms --chain /chaindata/reth_config
-
   zk:
     image: ghcr.io/matter-labs/zk-environment:cuda-12-latest
     depends_on:
-      - reth
+      - l1
       - postgres
     security_opt:
       - seccomp:unconfined
@@ -74,4 +70,3 @@ services:
 
 volumes:
   postgres-data:
-  reth-data:
