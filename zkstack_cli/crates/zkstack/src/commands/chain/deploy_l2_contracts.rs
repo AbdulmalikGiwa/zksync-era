@@ -13,13 +13,13 @@ use zkstack_cli_config::{
             input::DeployL2ContractsInput,
             output::{
                 ConsensusRegistryOutput, DefaultL2UpgradeOutput, InitializeBridgeOutput,
-                Multicall3Output, TimestampAsserterOutput,
+                L2DAValidatorAddressOutput, Multicall3Output, TimestampAsserterOutput,
             },
         },
         script_params::DEPLOY_L2_CONTRACTS_SCRIPT_PARAMS,
     },
     traits::{ReadConfig, SaveConfig, SaveConfigWithBasePath},
-    ChainConfig, ContractsConfig, EcosystemConfig,
+    ChainConfig, ContractsConfig, EcosystemConfig, ZkStackConfig, ZkStackConfigTrait,
 };
 
 use crate::{
@@ -33,6 +33,7 @@ pub enum Deploy2ContractsOption {
     ConsensusRegistry,
     Multicall3,
     TimestampAsserter,
+    L2DAValidator,
 }
 
 pub async fn run(
@@ -40,7 +41,8 @@ pub async fn run(
     shell: &Shell,
     deploy_option: Deploy2ContractsOption,
 ) -> anyhow::Result<()> {
-    let ecosystem_config = EcosystemConfig::from_file(shell)?;
+    // todo we actually need only chain config here
+    let ecosystem_config = ZkStackConfig::ecosystem(shell)?;
     let chain_config = ecosystem_config
         .load_current_chain()
         .context(MSG_CHAIN_NOT_INITIALIZED)?;
@@ -101,6 +103,16 @@ pub async fn run(
             )
             .await?;
         }
+        Deploy2ContractsOption::L2DAValidator => {
+            deploy_l2_da_validator(
+                shell,
+                &chain_config,
+                &ecosystem_config,
+                &mut contracts,
+                args,
+            )
+            .await?
+        }
     }
 
     contracts.save_with_base_path(shell, &chain_config.configs)?;
@@ -120,7 +132,7 @@ async fn build_and_deploy(
     mut update_config: impl FnMut(&Shell, &Path) -> anyhow::Result<()>,
     with_broadcast: bool,
 ) -> anyhow::Result<()> {
-    build_l2_contracts(shell.clone(), ecosystem_config.link_to_code.clone())?;
+    build_l2_contracts(shell.clone(), &ecosystem_config.contracts_path())?;
     call_forge(
         shell,
         chain_config,
@@ -132,7 +144,7 @@ async fn build_and_deploy(
     .await?;
     update_config(
         shell,
-        &DEPLOY_L2_CONTRACTS_SCRIPT_PARAMS.output(&chain_config.path_to_l1_foundry()),
+        &DEPLOY_L2_CONTRACTS_SCRIPT_PARAMS.output(&chain_config.path_to_foundry_scripts()),
     )?;
     Ok(())
 }
@@ -220,6 +232,28 @@ pub async fn deploy_timestamp_asserter(
     .await
 }
 
+pub async fn deploy_l2_da_validator(
+    shell: &Shell,
+    chain_config: &ChainConfig,
+    ecosystem_config: &EcosystemConfig,
+    contracts_config: &mut ContractsConfig,
+    forge_args: ForgeScriptArgs,
+) -> anyhow::Result<()> {
+    build_and_deploy(
+        shell,
+        chain_config,
+        ecosystem_config,
+        forge_args,
+        Some("runDeployL2DAValidator"),
+        |shell, out| {
+            contracts_config
+                .set_l2_da_validator_address(&L2DAValidatorAddressOutput::read(shell, out)?)
+        },
+        true,
+    )
+    .await
+}
+
 pub async fn deploy_l2_contracts(
     shell: &Shell,
     chain_config: &ChainConfig,
@@ -263,11 +297,11 @@ async fn call_forge(
     )
     .await?;
 
-    let foundry_contracts_path = chain_config.path_to_l1_foundry();
+    let foundry_contracts_path = chain_config.path_to_foundry_scripts();
     let secrets = chain_config.get_secrets_config().await?;
     input.save(
         shell,
-        DEPLOY_L2_CONTRACTS_SCRIPT_PARAMS.input(&chain_config.path_to_l1_foundry()),
+        DEPLOY_L2_CONTRACTS_SCRIPT_PARAMS.input(&chain_config.path_to_foundry_scripts()),
     )?;
 
     let mut forge = Forge::new(&foundry_contracts_path)
@@ -276,7 +310,8 @@ async fn call_forge(
             forge_args.clone(),
         )
         .with_ffi()
-        .with_rpc_url(secrets.l1_rpc_url()?);
+        .with_rpc_url(secrets.l1_rpc_url()?)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
     if with_broadcast {
         forge = forge.with_broadcast();
     }

@@ -6,7 +6,6 @@ use serde::Serialize;
 pub struct AvailDefaultConfig {
     pub api_node_url: String,
     pub app_id: u32,
-    pub finality_state: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -36,4 +35,17 @@ pub struct AvailSecrets {
     pub seed_phrase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gas_relay_api_key: Option<String>,
+}
+
+// SYSCOIN
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BitcoinConfig {
+    pub api_node_url: String,
+    pub poda_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BitcoinSecrets {
+    pub rpc_user: String,
+    pub rpc_password: String,
 }

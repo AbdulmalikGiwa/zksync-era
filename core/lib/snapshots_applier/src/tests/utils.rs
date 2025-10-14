@@ -184,6 +184,7 @@ pub(super) fn mock_l2_block_header(l2_block_number: L2BlockNumber) -> L2BlockHea
         gas_limit: 0,
         logs_bloom: Default::default(),
         pubdata_params: Default::default(),
+        rolling_txs_hash: Some(H256::zero()),
     }
 }
 
@@ -196,13 +197,20 @@ fn block_details_base(hash: H256) -> api::BlockDetailsBase {
         status: api::BlockStatus::Sealed,
         commit_tx_hash: None,
         committed_at: None,
+        commit_tx_finality: None,
         commit_chain_id: None,
         prove_tx_hash: None,
+        prove_tx_finality: None,
         proven_at: None,
         prove_chain_id: None,
         execute_tx_hash: None,
+        execute_tx_finality: None,
         executed_at: None,
         execute_chain_id: None,
+        precommit_tx_hash: None,
+        precommit_tx_finality: None,
+        precommitted_at: None,
+        precommit_chain_id: None,
         l1_gas_price: 0,
         l2_fair_gas_price: 0,
         fair_pubdata_price: None,
@@ -227,6 +235,7 @@ fn l2_block_details(
 fn l1_batch_details(number: L1BatchNumber, root_hash: H256) -> api::L1BatchDetails {
     api::L1BatchDetails {
         number,
+        commitment: Some(H256::repeat_byte(number.0 as u8)),
         base: block_details_base(root_hash),
     }
 }

@@ -524,10 +524,10 @@ impl TransactionsDal<'_, '_> {
     pub async fn mark_txs_as_executed_in_l1_batch(
         &mut self,
         l1_batch_number: L1BatchNumber,
-        transactions: &[TransactionExecutionResult],
+        tx_hashes: &[H256],
     ) -> DalResult<()> {
-        let hashes: Vec<_> = transactions.iter().map(|tx| tx.hash.as_bytes()).collect();
-        let l1_batch_tx_indexes: Vec<_> = (0..transactions.len() as i32).collect();
+        let hashes: Vec<_> = tx_hashes.iter().map(H256::as_bytes).collect();
+        let l1_batch_tx_indexes: Vec<_> = (0..tx_hashes.len() as i32).collect();
         sqlx::query!(
             r#"
             UPDATE transactions
@@ -550,7 +550,7 @@ impl TransactionsDal<'_, '_> {
         )
         .instrument("mark_txs_as_executed_in_l1_batch")
         .with_arg("l1_batch_number", &l1_batch_number)
-        .with_arg("transactions.len", &transactions.len())
+        .with_arg("transactions.len", &tx_hashes.len())
         .execute(self.storage)
         .await?;
         Ok(())
@@ -1828,12 +1828,14 @@ impl TransactionsDal<'_, '_> {
         .execute(self.storage)
         .await?;
 
-        tracing::debug!(
-            "Updated {} transactions for stashed accounts, stashed accounts amount: {}, stashed_accounts: {:?}",
-            result.rows_affected(),
-            stashed_addresses.len(),
-            stashed_accounts.iter().map(|a|format!("{:x}", a)).collect::<Vec<_>>()
-        );
+        if result.rows_affected() > 0 {
+            tracing::trace!(
+                "Updated {} transactions for stashed accounts, stashed accounts amount: {}, stashed_accounts: {:?}",
+                result.rows_affected(),
+                stashed_addresses.len(),
+                stashed_accounts.iter().map(|a|format!("{:x}", a)).collect::<Vec<_>>()
+            );
+        }
 
         let purged_addresses: Vec<_> = purged_accounts.iter().map(Address::as_bytes).collect();
         let result = sqlx::query!(
@@ -1849,12 +1851,13 @@ impl TransactionsDal<'_, '_> {
         .with_arg("purged_addresses.len", &purged_addresses.len())
         .execute(self.storage)
         .await?;
-
-        tracing::debug!(
-            "Updated {} transactions for purged accounts, purged accounts amount: {}",
-            result.rows_affected(),
-            purged_addresses.len()
-        );
+        if result.rows_affected() > 0 {
+            tracing::trace!(
+                "Updated {} transactions for purged accounts, purged accounts amount: {}",
+                result.rows_affected(),
+                purged_addresses.len()
+            );
+        }
 
         // Note, that transactions are updated in order of their hashes to avoid deadlocks with other UPDATE queries.
         let transactions = sqlx::query_as!(
@@ -2225,6 +2228,11 @@ impl TransactionsDal<'_, '_> {
                     H256::from_slice(&row.miniblock_hash)
                 }
             };
+            let interop_roots = self
+                .storage
+                .interop_root_dal()
+                .get_interop_roots(number)
+                .await?;
 
             data.push(L2BlockExecutionData {
                 number,
@@ -2232,6 +2240,7 @@ impl TransactionsDal<'_, '_> {
                 prev_block_hash,
                 virtual_blocks: l2_block_row.virtual_blocks as u32,
                 txs,
+                interop_roots,
             });
         }
         Ok(data)

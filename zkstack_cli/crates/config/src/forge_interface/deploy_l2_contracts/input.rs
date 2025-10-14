@@ -2,9 +2,9 @@ use ethers::types::Address;
 use serde::{Deserialize, Serialize};
 use zksync_basic_types::{commitment::L1BatchCommitmentMode, L2ChainId, U256};
 
-use crate::{traits::ZkStackConfig, ChainConfig, ContractsConfig, DAValidatorType};
+use crate::{traits::FileConfigTrait, ChainConfig, ContractsConfig, DAValidatorType};
 
-impl ZkStackConfig for DeployL2ContractsInput {}
+impl FileConfigTrait for DeployL2ContractsInput {}
 
 /// Fields corresponding to `contracts/l1-contracts/deploy-script-config-template/config-deploy-l2-config.toml`
 /// which are read by `contracts/l1-contracts/deploy-scripts/DeployL2Contracts.sol`.
@@ -53,7 +53,9 @@ async fn get_da_validator_type(config: &ChainConfig) -> anyhow::Result<DAValidat
         (L1BatchCommitmentMode::Rollup, _) => Ok(DAValidatorType::Rollup),
         (L1BatchCommitmentMode::Validium, None | Some("NoDA")) => Ok(DAValidatorType::NoDA),
         // SYSCOIN
-        (L1BatchCommitmentMode::Validium, Some("bitcoin")) => Ok(DAValidatorType::Rollup),
+        (L1BatchCommitmentMode::Validium, Some(s)) if s.eq_ignore_ascii_case("bitcoin") => {
+            Ok(DAValidatorType::Rollup)
+        }
         (L1BatchCommitmentMode::Validium, Some("Avail")) => Ok(DAValidatorType::Avail),
         (L1BatchCommitmentMode::Validium, Some("Eigen")) => Ok(DAValidatorType::NoDA), // TODO: change to EigenDA for M1
         _ => anyhow::bail!("DAValidatorType is not supported"),

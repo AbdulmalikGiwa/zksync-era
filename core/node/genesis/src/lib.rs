@@ -5,6 +5,7 @@
 use std::{collections::HashMap, fmt::Formatter};
 
 use anyhow::Context as _;
+use kzg::ZK_SYNC_BYTES_PER_BLOB;
 use zksync_config::GenesisConfig;
 use zksync_contracts::{
     hyperchain_contract, verifier_contract, BaseSystemContracts, BaseSystemContractsHashes,
@@ -14,7 +15,6 @@ use zksync_dal::{custom_genesis_export_dal::GenesisState, Connection, Core, Core
 use zksync_eth_client::{CallFunctionArgs, EthInterface};
 use zksync_merkle_tree::{domain::ZkSyncTree, TreeInstruction};
 use zksync_multivm::utils::get_max_gas_per_pubdata_byte;
-use zksync_system_constants::PRIORITY_EXPIRATION;
 use zksync_types::{
     block::{DeployedContract, L1BatchHeader, L2BlockHasher, L2BlockHeader},
     bytecode::BytecodeHash,
@@ -74,6 +74,8 @@ pub enum GenesisError {
     Other(#[from] anyhow::Error),
     #[error("Field: {0} required for genesis")]
     MalformedConfig(&'static str),
+    #[error("Commitment validation error: {0}")]
+    CommitmentValidation(#[from] zksync_types::commitment::CommitmentValidationError),
 }
 
 #[derive(Debug, Clone)]
@@ -191,7 +193,7 @@ pub fn make_genesis_batch_params(
     deduped_log_queries: Vec<LogQuery>,
     base_system_contract_hashes: BaseSystemContractsHashes,
     protocol_version: ProtocolVersionId,
-) -> (GenesisBatchParams, L1BatchCommitment) {
+) -> Result<(GenesisBatchParams, L1BatchCommitment), GenesisError> {
     let storage_logs = deduped_log_queries
         .into_iter()
         .filter(|log_query| log_query.rw_flag) // only writes
@@ -216,17 +218,17 @@ pub fn make_genesis_batch_params(
         base_system_contract_hashes,
         protocol_version,
     );
-    let block_commitment = L1BatchCommitment::new(commitment_input);
-    let commitment = block_commitment.hash().commitment;
+    let block_commitment = L1BatchCommitment::new(commitment_input, true)?;
+    let commitment = block_commitment.hash()?.commitment;
 
-    (
+    Ok((
         GenesisBatchParams {
             root_hash,
             commitment,
             rollup_last_leaf_index,
         },
         block_commitment,
-    )
+    ))
 }
 
 pub async fn insert_genesis_batch_with_custom_state(
@@ -297,7 +299,7 @@ pub async fn insert_genesis_batch_with_custom_state(
         deduped_log_queries,
         base_system_contract_hashes,
         genesis_params.minor_protocol_version(),
-    );
+    )?;
 
     save_genesis_l1_batch_metadata(
         &mut transaction,
@@ -504,6 +506,7 @@ pub(crate) async fn create_genesis_l1_batch_from_storage_logs_and_factory_deps(
         gas_limit: 0,
         logs_bloom: Bloom::zero(),
         pubdata_params: Default::default(),
+        rolling_txs_hash: Some(H256::zero()),
     };
 
     let mut transaction = storage.start_transaction().await?;
@@ -518,7 +521,14 @@ pub(crate) async fn create_genesis_l1_batch_from_storage_logs_and_factory_deps(
         .await?;
     transaction
         .blocks_dal()
-        .mark_l1_batch_as_sealed(&genesis_l1_batch_header, &[], &[], &[], Default::default())
+        .mark_l1_batch_as_sealed(
+            &genesis_l1_batch_header,
+            &[],
+            &[],
+            &[],
+            Default::default(),
+            ZK_SYNC_BYTES_PER_BLOB as u64,
+        )
         .await?;
     transaction
         .blocks_dal()
@@ -586,9 +596,10 @@ pub async fn save_set_chain_id_tx(
     storage: &mut Connection<'_, Core>,
     query_client: &dyn EthInterface,
     diamond_proxy_address: Address,
+    event_expiration_blocks: u64,
 ) -> anyhow::Result<()> {
     let to = query_client.block_number().await?.as_u64();
-    let from = to.saturating_sub(PRIORITY_EXPIRATION);
+    let from = to.saturating_sub(event_expiration_blocks);
 
     let filter = FilterBuilder::default()
         .address(vec![diamond_proxy_address])

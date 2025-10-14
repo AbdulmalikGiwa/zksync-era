@@ -7,6 +7,7 @@ use std::{
 
 use tokio::sync::watch;
 use zksync_config::GasAdjusterConfig;
+use zksync_dal::{ConnectionPool, Core};
 use zksync_eth_client::EthFeeInterface;
 use zksync_types::{
     commitment::L1BatchCommitmentMode, pubdata_da::PubdataSendingMode, L1_GAS_PER_PUBDATA_BYTE,
@@ -16,6 +17,7 @@ use zksync_web3_decl::client::{DynClient, L1, L2};
 
 use self::metrics::METRICS;
 use super::TxParamsProvider;
+use crate::l1_gas_price::blob_base_fee_predictor::predict_blob_base_fee;
 
 mod metrics;
 #[cfg(test)]
@@ -23,7 +25,7 @@ mod tests;
 
 #[derive(Debug)]
 pub struct GasAdjusterClient {
-    inner: Box<dyn EthFeeInterface>,
+    pub(crate) inner: Box<dyn EthFeeInterface>,
 }
 
 impl From<Box<DynClient<L1>>> for GasAdjusterClient {
@@ -63,6 +65,7 @@ pub struct GasAdjuster {
     pub(super) config: GasAdjusterConfig,
     pubdata_sending_mode: PubdataSendingMode,
     client: GasAdjusterClient,
+    connection_pool: ConnectionPool<Core>,
     commitment_mode: L1BatchCommitmentMode,
 }
 
@@ -72,6 +75,7 @@ impl GasAdjuster {
         config: GasAdjusterConfig,
         pubdata_sending_mode: PubdataSendingMode,
         commitment_mode: L1BatchCommitmentMode,
+        connection_pool: ConnectionPool<Core>,
     ) -> anyhow::Result<Self> {
         // Subtracting 1 from the "latest" block number to prevent errors in case
         // the info about the latest block is not yet present on the node.
@@ -122,6 +126,7 @@ impl GasAdjuster {
             pubdata_sending_mode,
             client,
             commitment_mode,
+            connection_pool,
         })
     }
 
@@ -210,19 +215,22 @@ impl GasAdjuster {
         gas_price
     }
 
-    pub async fn run(self: Arc<Self>, stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
-        loop {
-            if *stop_receiver.borrow() {
-                tracing::info!("Stop request received, gas_adjuster is shutting down");
-                break;
-            }
-
+    pub async fn run(
+        self: Arc<Self>,
+        mut stop_receiver: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        while !*stop_receiver.borrow() {
             if let Err(err) = self.keep_updated().await {
                 tracing::warn!("Cannot add the base fee to gas statistics: {}", err);
             }
 
-            tokio::time::sleep(self.config.poll_period).await;
+            // The stop receiver status will be checked immediately in the loop condition.
+            tokio::time::timeout(self.config.poll_period, stop_receiver.changed())
+                .await
+                .ok();
         }
+
+        tracing::info!("Stop request received, gas_adjuster is shutting down");
         Ok(())
     }
 
@@ -242,7 +250,7 @@ impl GasAdjuster {
         self.bound_gas_price(calculated_price)
     }
 
-    pub(crate) fn estimate_effective_pubdata_price(&self) -> u64 {
+    pub(crate) async fn estimate_effective_pubdata_price(&self) -> u64 {
         if let Some(price) = self.config.internal_enforced_pubdata_price {
             return price;
         }
@@ -262,7 +270,21 @@ impl GasAdjuster {
                 METRICS
                     .median_blob_base_fee
                     .set(blob_base_fee_median.as_u64());
-                let calculated_price = blob_base_fee_median.as_u64() as f64
+
+                let predicted_blob_base_fee = predict_blob_base_fee(
+                    &mut self
+                        .connection_pool
+                        .connection()
+                        .await
+                        .expect("Failed to acquire connection"),
+                    &self.client,
+                    blob_base_fee_median.as_u64(),
+                )
+                .await;
+
+                tracing::debug!("Predicted blob base fee: {predicted_blob_base_fee}, blob base fee median: {blob_base_fee_median}");
+
+                let calculated_price = predicted_blob_base_fee as f64
                     * BLOB_GAS_PER_BYTE as f64
                     * self.config.internal_pubdata_pricing_multiplier;
 
@@ -272,9 +294,14 @@ impl GasAdjuster {
                 (self.estimate_effective_gas_price() * L1_GAS_PER_PUBDATA_BYTE as u64) as f64,
             ),
             PubdataSendingMode::Custom => {
-                // Fix this when we have a better understanding of dynamic pricing for custom DA layers.
+                // SYSCOIN For Validium/Custom DA, we need to return a minimum gas per pubdata price
+                // to ensure that transactions settling on this gateway can calculate a valid
+                // gas_per_pubdata value. Without this, chains trying to settle on a Validium
+                // gateway will fail with "gas per pub data limit is zero" error.
+                // We use REQUIRED_L2_GAS_PRICE_PER_PUBDATA (800) as the minimum.
                 // GitHub issue: https://github.com/matter-labs/zksync-era/issues/2105
-                0
+                const MIN_PUBDATA_PRICE_FOR_VALIDIUM: u64 = 800; // Same as REQUIRED_L2_GAS_PRICE_PER_PUBDATA
+                MIN_PUBDATA_PRICE_FOR_VALIDIUM
             }
             PubdataSendingMode::RelayedL2Calldata => {
                 self.cap_pubdata_fee(self.l2_pubdata_price_statistics.median().as_u64() as f64)
@@ -286,7 +313,17 @@ impl GasAdjuster {
         // We will treat the max blob base fee as the maximal fee that we can take for each byte of pubdata.
         let max_blob_base_fee = self.config.max_blob_base_fee;
         match self.commitment_mode {
-            L1BatchCommitmentMode::Validium => 0,
+            L1BatchCommitmentMode::Validium => {
+                // SYSCOIN For Validium mode, we still need to return the pubdata fee
+                // to ensure chains settling on this gateway can function properly.
+                // We don't cap it to 0 as that would break settlement transactions.
+                // We apply the same max fee cap as for Rollup mode.
+                if pubdata_fee > max_blob_base_fee as f64 {
+                    tracing::warn!("Pubdata fee for Validium is high: {pubdata_fee}, using max allowed: {max_blob_base_fee}");
+                    return max_blob_base_fee;
+                }
+                pubdata_fee as u64
+            }
             L1BatchCommitmentMode::Rollup => {
                 if pubdata_fee > max_blob_base_fee as f64 {
                     tracing::error!("Blob base fee is too high: {pubdata_fee}, using max allowed: {max_blob_base_fee}");
@@ -323,11 +360,33 @@ impl TxParamsProvider for GasAdjuster {
         self.calculate_price_with_formula(time_in_mempool_in_l1_blocks, median)
     }
 
+    fn gateway_get_base_fee(&self, time_in_mempool_in_l1_blocks: u32) -> u64 {
+        // for gateway using median doesn't make sense since price doesn't change frequently (once per batch).
+        // to prevent tx from being stuck for a long time we are using last value instead.
+        let last = self.base_fee_statistics.last_added_value();
+        self.calculate_price_with_formula(time_in_mempool_in_l1_blocks, last)
+    }
+
     fn get_next_block_minimal_base_fee(&self) -> u64 {
         let last_block_base_fee = self.base_fee_statistics.last_added_value();
 
         // The next block's base fee will decrease by a maximum of 12.5%.
         last_block_base_fee * 875 / 1000
+    }
+
+    fn get_next_block_minimal_blob_base_fee(&self) -> u64 {
+        let last_block_blob_base_fee = self.blob_base_fee_statistics.last_added_value();
+        let multiplied = last_block_blob_base_fee * U256::from(875);
+        if multiplied > U256::from(u64::MAX) {
+            tracing::error!(
+                "Blob base fee last value is too high, using u64::MAX {}",
+                u64::MAX
+            );
+            u64::MAX
+        } else {
+            // The next block's blob base fee will decrease by a maximum of 12.5%.
+            multiplied.as_u64() / 1000
+        }
     }
 
     // Priority fee is set to constant, sourced from config.
@@ -341,32 +400,41 @@ impl TxParamsProvider for GasAdjuster {
         self.config.default_priority_fee_per_gas
     }
 
-    // The idea is that when we finally decide to send blob tx, we want to offer gas fees high
-    // enough to "almost be certain" that the transaction gets included. To never have to double
-    // the gas prices as then we have very little control how much we pay in the end. This strategy
-    // works as no matter if we double or triple such price, we pay the same block base fees.
-    fn get_blob_tx_base_fee(&self) -> u64 {
-        self.base_fee_statistics.last_added_value() * 2
+    fn get_blob_tx_base_fee(&self, time_in_mempool_in_l1_blocks: u32) -> u64 {
+        self.get_base_fee(time_in_mempool_in_l1_blocks)
     }
 
-    fn get_blob_tx_blob_base_fee(&self) -> u64 {
-        self.blob_base_fee_statistics.last_added_value().as_u64() * 2
+    fn get_blob_tx_blob_base_fee(&self, time_in_mempool_in_l1_blocks: u32) -> u64 {
+        let median = self.blob_base_fee_statistics.median();
+        let median_u64 = if median > U256::from(u64::MAX) {
+            tracing::error!(
+                "Blob base fee median is too high: {median}, using u64::MAX {}",
+                u64::MAX
+            );
+            u64::MAX
+        } else {
+            median.as_u64()
+        };
+        METRICS.median_blob_base_fee.set(median_u64);
+        self.calculate_price_with_formula(time_in_mempool_in_l1_blocks, median_u64)
     }
 
     fn get_blob_tx_priority_fee(&self) -> u64 {
-        self.get_priority_fee() * 2
+        self.get_priority_fee()
     }
 
     fn get_gateway_l2_pubdata_price(&self, time_in_mempool_in_l1_blocks: u32) -> u64 {
-        let median = self.l2_pubdata_price_statistics.median().as_u64();
-        METRICS.median_l2_pubdata_price.set(median);
-        self.calculate_price_with_formula(time_in_mempool_in_l1_blocks, median)
+        let last = self.l2_pubdata_price_statistics.last_added_value().as_u64();
+        self.calculate_price_with_formula(time_in_mempool_in_l1_blocks, last)
     }
 
     fn get_gateway_price_per_pubdata(&self, time_in_mempool_in_l1_blocks: u32) -> u64 {
-        let median = self.gas_per_pubdata_price_statistic.median();
-        METRICS.median_gas_per_pubdata_price.set(median);
-        self.calculate_price_with_formula(time_in_mempool_in_l1_blocks, median)
+        let last = self.gas_per_pubdata_price_statistic.last_added_value();
+        self.calculate_price_with_formula(time_in_mempool_in_l1_blocks, last)
+    }
+
+    fn get_parameter_b(&self) -> f64 {
+        self.config.pricing_formula_parameter_b
     }
 }
 

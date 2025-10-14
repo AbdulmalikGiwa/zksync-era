@@ -7,9 +7,12 @@ use zksync_basic_types::pubdata_da::PubdataSendingMode;
 
 use crate::{
     consensus::{ConsensusConfigPatch, ConsensusGenesisSpecs},
-    da::AvailConfig,
+    // SYSCOIN
+    da::{AvailConfig, BitcoinConfig},
     raw::{PatchedConfig, RawConfig},
-    ChainConfig, ObjectStoreConfig, ObjectStoreMode,
+    ChainConfig,
+    ObjectStoreConfig,
+    ObjectStoreMode,
 };
 
 pub struct RocksDbs {
@@ -39,7 +42,6 @@ impl FileArtifacts {
 #[derive(Debug)]
 pub struct EthSenderLimits {
     pub max_aggregated_tx_gas: u64,
-    pub max_eth_tx_data_size: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,7 +55,7 @@ pub enum CloudConnectionMode {
 pub struct GeneralConfig(RawConfig);
 
 impl GeneralConfig {
-    pub async fn read(shell: &Shell, path: PathBuf) -> anyhow::Result<Self> {
+    pub async fn read(shell: &Shell, path: &Path) -> anyhow::Result<Self> {
         RawConfig::read(shell, path).await.map(Self)
     }
 
@@ -169,7 +171,7 @@ impl GeneralConfigPatch {
     pub fn extract_consensus(
         &mut self,
         shell: &Shell,
-        path: PathBuf,
+        path: &Path,
     ) -> anyhow::Result<ConsensusConfigPatch> {
         let raw_consensus: serde_yaml::Mapping = self.0.base().get("consensus")?;
         self.0.remove("consensus");
@@ -212,6 +214,10 @@ impl GeneralConfigPatch {
             .get("proof_compressor.universal_setup_download_url")
     }
 
+    pub fn proof_compressor_setup_path(&self) -> anyhow::Result<PathBuf> {
+        self.0.base().get("proof_compressor.universal_setup_path")
+    }
+
     pub fn set_proof_compressor_setup_path(&mut self, path: &Path) -> anyhow::Result<()> {
         self.0
             .insert_path("proof_compressor.universal_setup_path", path)
@@ -243,10 +249,6 @@ impl GeneralConfigPatch {
         self.0.insert(
             "eth.sender.max_aggregated_tx_gas",
             limits.max_aggregated_tx_gas,
-        )?;
-        self.0.insert(
-            "eth.sender.max_eth_tx_data_size",
-            limits.max_eth_tx_data_size,
         )
     }
 
@@ -257,6 +259,13 @@ impl GeneralConfigPatch {
     pub fn set_avail_client(&mut self, client: &AvailConfig) -> anyhow::Result<()> {
         self.0.insert_yaml("da_client", client)?;
         self.0.insert("da_client.client", "Avail")?;
+        Ok(())
+    }
+
+    // SYSCOIN: configure Bitcoin DA client block in general.yaml
+    pub fn set_bitcoin_client(&mut self, client: &BitcoinConfig) -> anyhow::Result<()> {
+        self.0.insert_yaml("da_client", client)?;
+        self.0.insert("da_client.client", "Bitcoin")?;
         Ok(())
     }
 
@@ -318,7 +327,7 @@ fn set_file_backed_path_if_selected(
     Ok(())
 }
 
-pub fn override_config(shell: &Shell, path: PathBuf, chain: &ChainConfig) -> anyhow::Result<()> {
+pub fn override_config(shell: &Shell, path: &Path, chain: &ChainConfig) -> anyhow::Result<()> {
     let chain_config_path = chain.path_to_general_config();
     let override_config = serde_yaml::from_str(&shell.read_file(path)?)?;
     let mut chain_config = serde_yaml::from_str(&shell.read_file(chain_config_path.clone())?)?;

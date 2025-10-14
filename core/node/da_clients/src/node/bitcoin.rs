@@ -1,8 +1,8 @@
-use zksync_config::{configs::da_client::bitcoin::BitcoinSecrets, BitcoinConfig};
-use zksync_da_client::{node::DAClientResource, DataAvailabilityClient};
+use zksync_config::configs::da_client::bitcoin::{BitcoinConfig, BitcoinSecrets};
+use zksync_da_client::DataAvailabilityClient;
 use zksync_node_framework::{
     wiring_layer::{WiringError, WiringLayer},
-    FromContext, IntoContext,
+    FromContext,
 };
 
 use crate::bitcoin::BitcoinDAClient;
@@ -22,15 +22,10 @@ impl BitcoinWiringLayer {
 #[derive(Debug, FromContext)]
 pub struct Input {}
 
-#[derive(Debug, IntoContext)]
-pub struct Output {
-    pub client: DAClientResource,
-}
-
 #[async_trait::async_trait]
 impl WiringLayer for BitcoinWiringLayer {
     type Input = Input;
-    type Output = Output;
+    type Output = Box<dyn DataAvailabilityClient>;
 
     fn layer_name(&self) -> &'static str {
         "bitcoin_client_layer"
@@ -39,9 +34,6 @@ impl WiringLayer for BitcoinWiringLayer {
     async fn wire(self, _input: Self::Input) -> Result<Self::Output, WiringError> {
         let client: Box<dyn DataAvailabilityClient> =
             Box::new(BitcoinDAClient::new(self.config, self.secrets)?);
-
-        Ok(Self::Output {
-            client: DAClientResource(client),
-        })
+        Ok(client)
     }
 }

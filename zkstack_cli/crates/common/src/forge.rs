@@ -9,7 +9,7 @@ use ethers::{
     middleware::Middleware,
     prelude::{LocalWallet, Signer},
     types::{Address, H256, U256},
-    utils::{hex, hex::ToHex},
+    utils::{hex, hex::ToHexExt},
 };
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -56,9 +56,9 @@ pub struct ForgeScript {
 impl ForgeScript {
     /// Run the forge script command.
     pub fn run(mut self, shell: &Shell) -> anyhow::Result<()> {
-        // When running the DeployL1 script, we skip recompiling the Bridgehub
+        // When running the DeployCTM script, we skip recompiling the Bridgehub
         // because it must be compiled with a low optimizer-runs value.
-        if self.script_path == Path::new("deploy-scripts/DeployL1.s.sol") {
+        if self.script_path == Path::new("deploy-scripts/DeployCTM.s.sol") {
             let skip_path: String = String::from("contracts/bridgehub/*");
             self.args.add_arg(ForgeScriptArg::Skip { skip_path });
         }
@@ -166,6 +166,12 @@ impl ForgeScript {
         self.args.add_arg(ForgeScriptArg::PrivateKey {
             private_key: private_key.encode_hex(),
         });
+        self
+    }
+
+    /// SYSCOIN Add the timeout flag to the forge script command.
+    pub fn with_timeout(mut self, timeout: u64) -> Self {
+        self.args.add_arg(ForgeScriptArg::Timeout { timeout });
         self
     }
 
@@ -288,6 +294,11 @@ pub enum ForgeScriptArg {
     #[strum(to_string = "skip={skip_path}")]
     Skip {
         skip_path: String,
+    },
+    /// SYSCOIN
+    #[strum(to_string = "timeout={timeout}")]
+    Timeout {
+        timeout: u64,
     },
 }
 

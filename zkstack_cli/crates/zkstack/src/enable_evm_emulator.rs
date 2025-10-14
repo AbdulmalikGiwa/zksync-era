@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use ethers::{abi::parse_abi, contract::BaseContract, types::Address};
 use xshell::Shell;
 use zkstack_cli_common::{
@@ -5,9 +7,7 @@ use zkstack_cli_common::{
     spinner::Spinner,
     wallets::Wallet,
 };
-use zkstack_cli_config::{
-    forge_interface::script_params::ENABLE_EVM_EMULATOR_PARAMS, EcosystemConfig,
-};
+use zkstack_cli_config::forge_interface::script_params::ENABLE_EVM_EMULATOR_PARAMS;
 
 use crate::{
     messages::MSG_ENABLING_EVM_EMULATOR,
@@ -16,7 +16,7 @@ use crate::{
 
 pub async fn enable_evm_emulator(
     shell: &Shell,
-    ecosystem_config: &EcosystemConfig,
+    foundry_contracts_path: &Path,
     admin: Address,
     governor: &Wallet,
     target_address: Address,
@@ -30,13 +30,13 @@ pub async fn enable_evm_emulator(
     let calldata = enable_evm_emulator_contract
         .encode("chainAllowEvmEmulation", (admin, target_address))
         .unwrap();
-    let foundry_contracts_path = ecosystem_config.path_to_l1_foundry();
-    let forge = Forge::new(&foundry_contracts_path)
+    let forge = Forge::new(foundry_contracts_path)
         .script(&ENABLE_EVM_EMULATOR_PARAMS.script(), forge_args.clone())
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&calldata);
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
     enable_evm_inner(shell, governor, forge).await
 }
 

@@ -1,67 +1,94 @@
 # Launching a chain on ZK Gateway with Bitcoin DA
 
-This tutorial shows how to deploy Gateway contracts, create the first chain using Bitcoin as the data availability layer, and run the node using the new `smart_config` format.
+This tutorial shows how to deploy Gateway contracts, create the first chain using Bitcoin as the data availability
+layer, and run the node using the new `smart_config` format.
 
-1. **Create the ecosystem and initialize contracts**
+1. **Create the Gateway ecosystem (call it 'gateway' and use chain-id 57057) in Validium mode**
 
    ```bash
    zkstack ecosystem create
-   zkstack ecosystem init
    ```
 
-2. **Create the Gateway chain in Validium mode**
+2. **Init the Gateway ecosystem with Bitcoin DA (tanenbaum=5700, mainnet=57). Use L1 RPC when it asks.**
 
    ```bash
-   zkstack chain create \
-       --chain-name gateway \
-       --chain-id 580 \
-       --l1-batch-commit-data-generator-mode validium
+   cd gateway
+   zkstack dev clean contracts-cache
+   FOUNDRY_EVM_VERSION=shanghai FOUNDRY_CHAIN_ID=5700 zkstack ecosystem init
    ```
 
-3. **Init the Gateway chain with Bitcoin DA**
+3. **Convert the chain to a Gateway settlement layer**
 
    ```bash
-   zkstack chain init \
-       --chain gateway \
-       --validium-type bitcoin
+   FOUNDRY_EVM_VERSION=shanghai FOUNDRY_CHAIN_ID=5700 zkstack chain gateway create-tx-filterer --chain gateway
+   FOUNDRY_EVM_VERSION=shanghai FOUNDRY_CHAIN_ID=5700 zkstack chain gateway convert-to-gateway --chain gateway
+
+   # Apply gateway override
+   zkstack dev config-writer --path ../etc/env/file_based/overrides/gateway.yaml --chain gateway
+
+   # Apply network override (for testnet)
+   zkstack dev config-writer --path ../etc/env/file_based/overrides/testnet.yaml --chain gateway
+
+   # OR For mainnet:
+   zkstack dev config-writer --path ../etc/env/file_based/overrides/mainnet.yaml --chain gateway
    ```
 
-4. **Convert the chain to a Gateway settlement layer**
-
-   ```bash
-   zkstack chain gateway convert-to-gateway --chain gateway
-   ```
-
-5. **Create and register a child Rollup chain (zkSYS) on Gateway**
+4. **Create and register a child Rollup chain (zkSYS) on Gateway**
 
    ```bash
    # Create the chain
    zkstack chain create \
        --chain-name zksys \
-       --chain-id 581 \
+       --chain-id 57001 \
        --l1-batch-commit-data-generator-mode rollup
 
-   # Initialize it against Gateway (uses addresses generated in `chains/gateway/configs/gateway.yaml`)
-   zkstack chain init \
-       --chain zksys \
-       --gateway-config-path ./chains/gateway/configs/gateway.yaml
+   # Initialize it against Gateway (uses addresses generated in `chains/gateway/configs/gateway.yaml`). Use L1 RPC when it asks for RPC here as well.
+   FOUNDRY_EVM_VERSION=shanghai FOUNDRY_CHAIN_ID=5700 zkstack chain init --chain zksys
+
+   # Apply l3_to_gateway override (recommended for L3 chains settling on gateway)
+   zkstack dev config-writer --path ../etc/env/file_based/overrides/l3_to_gateway.yaml --chain zksys
+
+   # Migrate the chain to gateway
+   FOUNDRY_EVM_VERSION=shanghai FOUNDRY_CHAIN_ID=5700 zkstack chain gateway migrate-to-gateway --chain zksys --gateway-chain-name gateway
    ```
 
    The commands deploy contracts, register the chain in BridgeHub and link it to Gateway.
 
-6. **Adjust the Gateway/zkSYS chain configuration**
+5. **Adjust the Gateway/zkSYS chain configuration**
 
-   Edit `chains/gateway/configs/general.yaml` and set
+   Add the DA client configuration for Syscoin PoDA:
 
    ```yaml
-   state_keeper:
-     max_pubdata_per_batch: 750_000
+   da_client:
+     client: Bitcoin
+     api_node_url: http://localhost:8369 # Syscoin NEVM RPC/API node
+     poda_url: https://poda.syscoin.org # PoDA endpoint (or your own)
    ```
-   You may also want to edit the zkSYS configuration as well to update max_pubdata_per_batch.
 
-   Add the [Bitcoin DA smart_config](./bitcoin-da-client.md#smart_config-example) snippet for the DA client.
+   Then set the required secrets (credentials and Gateway RPC URL) in `chains/gateway/configs/secrets.yaml`:
 
-7. **Run the nodes**
+   ```yaml
+   l1:
+     gateway_rpc_url: http://127.0.0.1:4050/ # Gateway chain RPC (your Gateway node)
+
+   da_client:
+     rpc_user: YOUR_SYSCOIN_RPC_USER
+     rpc_password: YOUR_SYSCOIN_RPC_PASSWORD
+   ```
+
+   Or, as environment variables (alternative to editing secrets):
+
+   ```bash
+   # Gateway server (settlement layer)
+   export L1_GATEWAY_WEB3_URL="http://127.0.0.1:4050/"
+
+   # External node for Gateway
+   export EN_GATEWAY_URL="http://127.0.0.1:4050/"
+   ```
+
+   For more details, see the [Bitcoin DA smart_config](./bitcoin-da-client.md#smart_config-example).
+
+6. **Run the nodes**
 
    ```bash
    # Gateway node (Validium + Bitcoin DA)

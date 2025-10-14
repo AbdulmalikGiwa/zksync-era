@@ -15,10 +15,12 @@ use zksync_types::{
     abi::ZkChainSpecificUpgradeData,
     api::{ChainAggProof, Log},
     ethabi::{decode, Contract, ParamType},
+    protocol_version::ProtocolSemanticVersion,
+    u256_to_h256,
     utils::encode_ntv_asset_id,
     web3::{BlockId, BlockNumber, Filter, FilterBuilder},
-    Address, L1BatchNumber, L2ChainId, SLChainId, H256, SHARED_BRIDGE_ETHER_TOKEN_ADDRESS, U256,
-    U64,
+    Address, L1BatchNumber, L2BlockNumber, L2ChainId, SLChainId, H256,
+    SHARED_BRIDGE_ETHER_TOKEN_ADDRESS, U256, U64,
 };
 use zksync_web3_decl::{
     client::{Network, L2},
@@ -54,11 +56,13 @@ pub trait EthClient: 'static + fmt::Debug + Send + Sync {
         &self,
         verifier_address: Address,
     ) -> Result<Option<H256>, ContractCallError>;
-    /// Returns upgrade diamond cut by packed protocol version.
-    async fn diamond_cut_by_version(
+
+    /// Returns upgrade diamond cuts since the protocol version.
+    /// It will include all potentially skipped versions
+    async fn diamond_cuts_since_version(
         &self,
-        packed_version: H256,
-    ) -> EnrichedClientResult<Option<Vec<u8>>>;
+        version: ProtocolSemanticVersion,
+    ) -> EnrichedClientResult<Vec<Vec<u8>>>;
 
     async fn get_published_preimages(
         &self,
@@ -102,6 +106,7 @@ pub struct EthHttpQueryClient<Net: Network> {
     bytecode_supplier_addr: Option<Address>,
     wrapped_base_token_store: Option<Address>,
     l1_shared_bridge_addr: Option<Address>,
+    l1_message_root_address: Option<Address>,
     // Only present for post-shared bridge chains.
     state_transition_manager_address: Option<Address>,
     server_notifier_address: Option<Address>,
@@ -126,6 +131,7 @@ where
         bytecode_supplier_addr: Option<Address>,
         wrapped_base_token_store: Option<Address>,
         l1_shared_bridge_addr: Option<Address>,
+        l1_message_root_address: Option<Address>,
         state_transition_manager_address: Option<Address>,
         chain_admin_address: Option<Address>,
         server_notifier_address: Option<Address>,
@@ -162,21 +168,21 @@ where
             confirmations_for_eth_event,
             wrapped_base_token_store,
             l1_shared_bridge_addr,
+            l1_message_root_address,
             l2_chain_id,
         }
     }
 
     fn get_default_address_list(&self) -> Vec<Address> {
-        [
+        let addresses = [
             Some(self.diamond_proxy_addr),
             self.state_transition_manager_address,
             self.chain_admin_address,
             self.server_notifier_address,
             Some(L2_MESSAGE_ROOT_ADDRESS),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
+            self.l1_message_root_address,
+        ];
+        addresses.into_iter().flatten().collect()
     }
 
     #[async_recursion::async_recursion]
@@ -224,6 +230,7 @@ where
                 || err_message.contains(TOO_BIG_RANGE_RETH)
                 || err_message.contains(TOO_MANY_RESULTS_CHAINSTACK)
                 || err_message.contains(REQUEST_REJECTED_503)
+                || err.is_timeout()
             {
                 // get the numeric block ids
                 let from_number = match from {
@@ -284,6 +291,31 @@ where
         }
 
         result
+    }
+
+    async fn block_for_diamond_cut_for_version(
+        &self,
+        packed_version: H256,
+    ) -> EnrichedClientResult<Option<U64>> {
+        let Some(state_transition_manager_address) = self.state_transition_manager_address else {
+            return Ok(None);
+        };
+
+        let to_block = self.client.block_number().await?;
+        let from_block = to_block.saturating_sub((LOOK_BACK_BLOCK_RANGE - 1).into());
+
+        let logs = self
+            .get_events_inner(
+                from_block.into(),
+                to_block.into(),
+                Some(vec![self.new_upgrade_cut_data_signature]),
+                Some(vec![packed_version]),
+                Some(vec![state_transition_manager_address]),
+                RETRY_LIMIT,
+            )
+            .await?;
+
+        Ok(logs.into_iter().next().and_then(|log| log.block_number))
     }
 }
 
@@ -418,31 +450,43 @@ where
         }
     }
 
-    async fn diamond_cut_by_version(
+    async fn diamond_cuts_since_version(
         &self,
-        packed_version: H256,
-    ) -> EnrichedClientResult<Option<Vec<u8>>> {
+        from_version: ProtocolSemanticVersion,
+    ) -> EnrichedClientResult<Vec<Vec<u8>>> {
         let Some(state_transition_manager_address) = self.state_transition_manager_address else {
-            return Ok(None);
+            return Ok(vec![]);
         };
 
         let to_block = self.client.block_number().await?;
-        let from_block = to_block.saturating_sub((LOOK_BACK_BLOCK_RANGE - 1).into());
+
+        let from_block = self
+            .block_for_diamond_cut_for_version(u256_to_h256(from_version.pack()))
+            .await?
+            .ok_or(EnrichedClientError::custom(
+                format!("No diamond cut found for version {from_version}"),
+                "diamond_cuts_since_version",
+            ))
+            .map_err(|e| {
+                tracing::error!("{e}");
+                e
+            })
+            .unwrap_or(to_block.saturating_sub((LOOK_BACK_BLOCK_RANGE - 1).into()))
+            + 1;
 
         let logs = self
             .get_events_inner(
                 from_block.into(),
                 to_block.into(),
                 Some(vec![self.new_upgrade_cut_data_signature]),
-                Some(vec![packed_version]),
+                None,
                 Some(vec![state_transition_manager_address]),
                 RETRY_LIMIT,
             )
             .await?;
 
-        Ok(logs.into_iter().next().map(|log| log.data.0))
+        Ok(logs.into_iter().map(|log| log.data.0).collect())
     }
-
     async fn chain_id(&self) -> EnrichedClientResult<SLChainId> {
         self.client.fetch_chain_id().await
     }
@@ -574,7 +618,13 @@ pub trait ZkSyncExtentionEthClient: EthClient {
 
     async fn get_chain_log_proof(
         &self,
-        l1_batch_number: L1BatchNumber,
+        batch_number: L1BatchNumber,
+        chain_id: L2ChainId,
+    ) -> EnrichedClientResult<Option<ChainAggProof>>;
+
+    async fn get_chain_log_proof_until_msg_root(
+        &self,
+        block_number: L2BlockNumber,
         chain_id: L2ChainId,
     ) -> EnrichedClientResult<Option<ChainAggProof>>;
 
@@ -593,13 +643,25 @@ impl ZkSyncExtentionEthClient for EthHttpQueryClient<L1> {
 
     async fn get_chain_log_proof(
         &self,
-        _l1_batch_number: L1BatchNumber,
+        _batch_number: L1BatchNumber,
         _chain_id: L2ChainId,
     ) -> EnrichedClientResult<Option<ChainAggProof>> {
         //TODO(EVM-959): Implement it using l1 contracts
         Err(EnrichedClientError::custom(
             "Method is not supported",
             "get_chain_log_proof",
+        ))
+    }
+
+    async fn get_chain_log_proof_until_msg_root(
+        &self,
+        _block_number: L2BlockNumber,
+        _chain_id: L2ChainId,
+    ) -> EnrichedClientResult<Option<ChainAggProof>> {
+        //TODO(EVM-959): Implement it using l1 contracts
+        Err(EnrichedClientError::custom(
+            "Method is not supported",
+            "get_chain_log_proof_until_msg_root",
         ))
     }
 
@@ -623,13 +685,24 @@ impl ZkSyncExtentionEthClient for EthHttpQueryClient<L2> {
 
     async fn get_chain_log_proof(
         &self,
-        l1_batch_number: L1BatchNumber,
+        batch_number: L1BatchNumber,
         chain_id: L2ChainId,
     ) -> EnrichedClientResult<Option<ChainAggProof>> {
         self.client
-            .get_chain_log_proof(l1_batch_number, chain_id)
+            .get_chain_log_proof(batch_number, chain_id)
             .await
             .map_err(|err| EnrichedClientError::new(err, "unstable_getChainLogProof"))
+    }
+
+    async fn get_chain_log_proof_until_msg_root(
+        &self,
+        block_number: L2BlockNumber,
+        chain_id: L2ChainId,
+    ) -> EnrichedClientResult<Option<ChainAggProof>> {
+        self.client
+            .get_chain_log_proof_until_msg_root(block_number, chain_id)
+            .await
+            .map_err(|err| EnrichedClientError::new(err, "unstable_getChainLogProofUntilMsgRoot"))
     }
 
     async fn get_chain_root_l2(

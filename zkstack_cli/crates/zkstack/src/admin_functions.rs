@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use ethers::{
@@ -17,8 +17,8 @@ use zkstack_cli_common::{
 };
 use zkstack_cli_config::{
     forge_interface::script_params::ACCEPT_GOVERNANCE_SCRIPT_PARAMS,
-    traits::{ReadConfig, ZkStackConfig},
-    ChainConfig, ContractsConfig, EcosystemConfig,
+    traits::{FileConfigTrait, ReadConfig},
+    ChainConfig, ContractsConfig, EcosystemConfig, ZkStackConfigTrait,
 };
 use zksync_basic_types::U256;
 
@@ -49,7 +49,9 @@ lazy_static! {
             "function notifyServerMigrationFromGateway(address _bridgehub, uint256 _chainId, bool _shouldSend) public",
             "function notifyServerMigrationToGateway(address _bridgehub, uint256 _chainId, bool _shouldSend) public",
             "function startMigrateChainFromGateway(address bridgehub,uint256 l1GasPrice,uint256 l2ChainId,uint256 gatewayChainId,bytes memory l1DiamondCutData,address refundRecipient,bool _shouldSend)",
-            "function prepareUpgradeZKChainOnGateway(uint256 l1GasPrice, uint256 oldProtocolVersion, bytes memory upgradeCutData, address chainDiamondProxyOnGateway, uint256 gatewayChainId, uint256 chainId, address bridgehub, address l1AssetRouterProxy, address refundRecipient, bool shouldSend)"
+            "function prepareUpgradeZKChainOnGateway(uint256 l1GasPrice, uint256 oldProtocolVersion, bytes memory upgradeCutData, address chainDiamondProxyOnGateway, uint256 gatewayChainId, uint256 chainId, address bridgehub, address l1AssetRouterProxy, address refundRecipient, bool shouldSend)",
+            "function enableValidator(address bridgehub,uint256 l2ChainId,address validatorAddress,address validatorTimelock,bool _shouldSend) public",
+            "function ecosystemAdminExecuteCalls(bytes memory callsToExecute, address ecosystemAdminAddr)"
         ])
         .unwrap(),
     );
@@ -57,7 +59,7 @@ lazy_static! {
 
 pub async fn accept_admin(
     shell: &Shell,
-    ecosystem_config: &EcosystemConfig,
+    foundry_contracts_path: PathBuf,
     admin: Address,
     governor: &Wallet,
     target_address: Address,
@@ -73,7 +75,6 @@ pub async fn accept_admin(
     let calldata = ADMIN_FUNCTIONS
         .encode("chainAdminAcceptAdmin", (admin, target_address))
         .unwrap();
-    let foundry_contracts_path = ecosystem_config.path_to_l1_foundry();
     let forge = Forge::new(&foundry_contracts_path)
         .script(
             &ACCEPT_GOVERNANCE_SCRIPT_PARAMS.script(),
@@ -82,13 +83,14 @@ pub async fn accept_admin(
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&calldata);
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
     accept_ownership(shell, governor, forge).await
 }
 
 pub async fn accept_owner(
     shell: &Shell,
-    ecosystem_config: &EcosystemConfig,
+    foundry_contracts_path: PathBuf,
     governor_contract: Address,
     governor: &Wallet,
     target_address: Address,
@@ -102,7 +104,6 @@ pub async fn accept_owner(
     let calldata = ADMIN_FUNCTIONS
         .encode("governanceAcceptOwner", (governor_contract, target_address))
         .unwrap();
-    let foundry_contracts_path = ecosystem_config.path_to_l1_foundry();
     let forge = Forge::new(&foundry_contracts_path)
         .script(
             &ACCEPT_GOVERNANCE_SCRIPT_PARAMS.script(),
@@ -111,7 +112,8 @@ pub async fn accept_owner(
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&calldata);
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
     accept_ownership(shell, governor, forge).await
 }
 
@@ -135,7 +137,7 @@ pub async fn make_permanent_rollup(
             (chain_admin_addr, diamond_proxy_address),
         )
         .unwrap();
-    let foundry_contracts_path = ecosystem_config.path_to_l1_foundry();
+    let foundry_contracts_path = ecosystem_config.path_to_foundry_scripts();
     let forge = Forge::new(&foundry_contracts_path)
         .script(
             &ACCEPT_GOVERNANCE_SCRIPT_PARAMS.script(),
@@ -144,7 +146,8 @@ pub async fn make_permanent_rollup(
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&calldata);
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
     accept_ownership(shell, governor, forge).await
 }
 
@@ -152,7 +155,67 @@ pub async fn make_permanent_rollup(
 pub async fn governance_execute_calls(
     shell: &Shell,
     ecosystem_config: &EcosystemConfig,
-    governor: &Wallet,
+    mode: AdminScriptMode,
+    encoded_calls: Vec<u8>,
+    forge_args: &ForgeScriptArgs,
+    l1_rpc_url: String,
+    governance_address: Option<Address>,
+) -> anyhow::Result<AdminScriptOutput> {
+    // resume doesn't properly work here.
+    let mut forge_args = forge_args.clone();
+    forge_args.resume = false;
+
+    let governance_address = match governance_address {
+        Some(addr) => addr,
+        None => {
+            let cfg = ecosystem_config
+                .get_contracts_config()
+                .context("Failed to fetch contracts config to resolve governance address")?;
+            cfg.l1.governance_addr
+        }
+    };
+
+    let calldata = ADMIN_FUNCTIONS
+        .encode(
+            "governanceExecuteCalls",
+            (Token::Bytes(encoded_calls), governance_address),
+        )
+        .unwrap();
+    let foundry_contracts_path = ecosystem_config.path_to_foundry_scripts();
+    let forge = Forge::new(&foundry_contracts_path)
+        .script(
+            &ACCEPT_GOVERNANCE_SCRIPT_PARAMS.script(),
+            forge_args.clone(),
+        )
+        .with_ffi()
+        .with_rpc_url(l1_rpc_url)
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
+
+    let description = "executing governance calls";
+    let (forge, spinner_text) = match mode {
+        AdminScriptMode::OnlySave => (forge, format!("Preparing calldata for {description}")),
+        AdminScriptMode::Broadcast(wallet) => {
+            let forge = forge.with_broadcast();
+            let forge = fill_forge_private_key(forge, Some(&wallet), WalletOwner::Governor)?;
+            check_the_balance(&forge).await?;
+            (forge, format!("Executing {description}"))
+        }
+    };
+
+    let spinner = Spinner::new(&spinner_text);
+    forge.run(shell)?;
+    spinner.finish();
+
+    let output_path = ACCEPT_GOVERNANCE_SCRIPT_PARAMS.output(&foundry_contracts_path);
+    Ok(AdminScriptOutputInner::read(shell, output_path)?.into())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn ecosystem_admin_execute_calls(
+    shell: &Shell,
+    ecosystem_config: &EcosystemConfig,
+    ecosystem_admin: &Wallet,
     encoded_calls: Vec<u8>,
     forge_args: &ForgeScriptArgs,
     l1_rpc_url: String,
@@ -161,15 +224,15 @@ pub async fn governance_execute_calls(
     let mut forge_args = forge_args.clone();
     forge_args.resume = false;
 
-    let governance_address = ecosystem_config.get_contracts_config()?.l1.governance_addr;
+    let ecosystem_admin_addr = ecosystem_config.get_contracts_config()?.l1.chain_admin_addr;
 
     let calldata = ADMIN_FUNCTIONS
         .encode(
-            "governanceExecuteCalls",
-            (Token::Bytes(encoded_calls), governance_address),
+            "ecosystemAdminExecuteCalls",
+            (Token::Bytes(encoded_calls), ecosystem_admin_addr),
         )
         .unwrap();
-    let foundry_contracts_path = ecosystem_config.path_to_l1_foundry();
+    let foundry_contracts_path = ecosystem_config.path_to_foundry_scripts();
     let forge = Forge::new(&foundry_contracts_path)
         .script(
             &ACCEPT_GOVERNANCE_SCRIPT_PARAMS.script(),
@@ -178,8 +241,9 @@ pub async fn governance_execute_calls(
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&calldata);
-    accept_ownership(shell, governor, forge).await
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
+    accept_ownership(shell, ecosystem_admin, forge).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -214,7 +278,7 @@ pub async fn admin_execute_upgrade(
             ),
         )
         .unwrap();
-    let foundry_contracts_path = ecosystem_config.path_to_l1_foundry();
+    let foundry_contracts_path = ecosystem_config.path_to_foundry_scripts();
     let forge = Forge::new(&foundry_contracts_path)
         .script(
             &ACCEPT_GOVERNANCE_SCRIPT_PARAMS.script(),
@@ -223,7 +287,8 @@ pub async fn admin_execute_upgrade(
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&calldata);
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
     accept_ownership(shell, governor, forge).await
 }
 
@@ -259,7 +324,7 @@ pub async fn admin_schedule_upgrade(
             ),
         )
         .unwrap();
-    let foundry_contracts_path = ecosystem_config.path_to_l1_foundry();
+    let foundry_contracts_path = ecosystem_config.path_to_foundry_scripts();
     let forge = Forge::new(&foundry_contracts_path)
         .script(
             &ACCEPT_GOVERNANCE_SCRIPT_PARAMS.script(),
@@ -268,7 +333,8 @@ pub async fn admin_schedule_upgrade(
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&calldata);
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
     accept_ownership(shell, governor, forge).await
 }
 
@@ -309,7 +375,7 @@ pub async fn admin_update_validator(
             ),
         )
         .unwrap();
-    let foundry_contracts_path = ecosystem_config.path_to_l1_foundry();
+    let foundry_contracts_path = ecosystem_config.path_to_foundry_scripts();
     let forge = Forge::new(&foundry_contracts_path)
         .script(
             &ACCEPT_GOVERNANCE_SCRIPT_PARAMS.script(),
@@ -318,7 +384,8 @@ pub async fn admin_update_validator(
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&calldata);
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
     accept_ownership(shell, governor, forge).await
 }
 
@@ -335,6 +402,7 @@ async fn accept_ownership(
     Ok(())
 }
 
+#[derive(Clone)]
 pub enum AdminScriptMode {
     OnlySave,
     Broadcast(Wallet),
@@ -347,12 +415,12 @@ impl AdminScriptMode {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-struct AdminScriptOutputInner {
+pub(crate) struct AdminScriptOutputInner {
     admin_address: Address,
     encoded_data: String,
 }
 
-impl ZkStackConfig for AdminScriptOutputInner {}
+impl FileConfigTrait for AdminScriptOutputInner {}
 
 #[derive(Debug, Clone, Default)]
 pub struct AdminScriptOutput {
@@ -385,7 +453,8 @@ pub async fn call_script(
         )
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
-        .with_calldata(&calldata);
+        .with_calldata(&calldata)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
 
     let (forge, spiner_text) = match mode {
         AdminScriptMode::OnlySave => (forge, format!("Preparing calldata for {description}")),
@@ -646,6 +715,43 @@ pub(crate) async fn enable_validator_via_gateway(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) async fn enable_validator(
+    shell: &Shell,
+    forge_args: &ForgeScriptArgs,
+    foundry_contracts_path: &Path,
+    mode: AdminScriptMode,
+    l1_bridgehub: Address,
+    l2_chain_id: u64,
+    validator_address: Address,
+    validator_timelock: Address,
+    l1_rpc_url: String,
+) -> anyhow::Result<AdminScriptOutput> {
+    let calldata = ADMIN_FUNCTIONS
+        .encode(
+            "enableValidator",
+            (
+                l1_bridgehub,
+                U256::from(l2_chain_id),
+                validator_address,
+                validator_timelock,
+                mode.should_send(),
+            ),
+        )
+        .unwrap();
+
+    call_script(
+        shell,
+        forge_args,
+        foundry_contracts_path,
+        mode,
+        calldata,
+        l1_rpc_url,
+        &format!("enabling validator {:#?} via gateway", validator_address),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn notify_server_migration_to_gateway(
     shell: &Shell,
     forge_args: &ForgeScriptArgs,
@@ -791,7 +897,6 @@ pub(crate) async fn admin_l1_l2_tx(
     .await
 }
 
-#[cfg(feature = "v28_precompiles")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_upgrade_zk_chain_on_gateway(
     shell: &Shell,

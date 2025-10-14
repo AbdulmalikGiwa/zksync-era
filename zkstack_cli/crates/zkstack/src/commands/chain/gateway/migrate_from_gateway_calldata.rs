@@ -8,7 +8,7 @@ use ethers::{
 use lazy_static::lazy_static;
 use xshell::Shell;
 use zkstack_cli_common::{ethereum::get_ethers_provider, logger};
-use zkstack_cli_config::{traits::ReadConfig, ContractsConfig};
+use zkstack_cli_config::{traits::ReadConfig, ContractsConfig, ZkStackConfig, ZkStackConfigTrait};
 
 use super::{
     gateway_common::{
@@ -19,7 +19,7 @@ use super::{
 use crate::{
     abi::{BridgehubAbi, ZkChainAbi},
     admin_functions::{start_migrate_chain_from_gateway, AdminScriptMode},
-    commands::chain::utils::{display_admin_script_output, get_default_foundry_path},
+    commands::chain::utils::display_admin_script_output,
 };
 
 lazy_static! {
@@ -56,7 +56,7 @@ pub struct MigrateFromGatewayCalldataArgs {
 
     /// Whether to force providing the full migration calldata even if the chain
     /// isn't strictly ready for final calls.
-    #[clap(long, default_missing_value = "false")]
+    #[clap(long, default_missing_value = "true")]
     pub no_cross_check: bool,
 }
 
@@ -64,7 +64,7 @@ pub struct MigrateFromGatewayCalldataArgs {
 ///
 pub async fn run(shell: &Shell, params: MigrateFromGatewayCalldataArgs) -> anyhow::Result<()> {
     let forge_args = Default::default();
-    let contracts_foundry_path = get_default_foundry_path(shell)?;
+    let contracts_foundry_path = ZkStackConfig::from_file(shell)?.path_to_foundry_scripts();
 
     if !params.no_cross_check {
         let state = get_gateway_migration_state(
@@ -85,16 +85,14 @@ pub async fn run(shell: &Shell, params: MigrateFromGatewayCalldataArgs) -> anyho
                 logger::info(
                     "The server is ready to start the migration. Preparing the calldata...",
                 );
-                logger::warn("Important! It may take awhile for Gateway to detect the migration transaction. If you are sure you've already sent it, no need to resend it");
+                logger::warn("Important! It may take a while for Gateway to detect the migration transaction. If you are sure you've already sent it, no need to resend it");
                 // It is the expected case, it will be handled later in the file
             }
             GatewayMigrationProgressState::AwaitingFinalization => {
-                logger::info("The transaction to migrate chain on top of Gateway has been processed, but the GW chain has not yet finalized it");
-                return Ok(());
+                anyhow::bail!("The transaction to migrate chain on top of Gateway has been processed, but the GW chain has not yet finalized it");
             }
             GatewayMigrationProgressState::PendingManualFinalization => {
-                logger::info("The chain migration to Gateway has been finalized on the Gateway side. Please use the corresponding command to finalize its migration to L1");
-                return Ok(());
+                anyhow::bail!("The chain migration to Gateway has been finalized on the Gateway side. Please use the corresponding command to finalize its migration to L1");
             }
             GatewayMigrationProgressState::Finished => {
                 let l1_provider = get_ethers_provider(&params.l1_rpc_url)?;
@@ -122,14 +120,13 @@ pub async fn run(shell: &Shell, params: MigrateFromGatewayCalldataArgs) -> anyho
 
                 return Ok(());
             }
-            _ => {
-                let msg = message_for_gateway_migration_progress_state(
+            GatewayMigrationProgressState::NotStarted
+            | GatewayMigrationProgressState::NotificationSent
+            | GatewayMigrationProgressState::NotificationReceived(_) => {
+                anyhow::bail!(message_for_gateway_migration_progress_state(
                     state,
                     MigrationDirection::FromGateway,
-                );
-                logger::info(&msg);
-
-                return Ok(());
+                ));
             }
         }
     }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use url::Url;
 use xshell::Shell;
@@ -7,7 +7,8 @@ use zksync_consensus_crypto::TextFmt;
 use zksync_consensus_roles::{node, validator};
 
 use crate::{
-    da::AvailSecrets,
+    // SYSCOIN
+    da::{AvailSecrets, BitcoinSecrets},
     raw::{PatchedConfig, RawConfig},
 };
 
@@ -37,7 +38,7 @@ impl RawConsensusKeys {
 pub struct SecretsConfig(RawConfig);
 
 impl SecretsConfig {
-    pub async fn read(shell: &Shell, path: PathBuf) -> anyhow::Result<Self> {
+    pub async fn read(shell: &Shell, path: &Path) -> anyhow::Result<Self> {
         RawConfig::read(shell, path).await.map(Self)
     }
 
@@ -51,6 +52,10 @@ impl SecretsConfig {
 
     pub fn l1_rpc_url(&self) -> anyhow::Result<String> {
         self.0.get("l1.l1_rpc_url")
+    }
+
+    pub fn gateway_rpc_url(&self) -> anyhow::Result<String> {
+        self.0.get("l1.gateway_rpc_url")
     }
 
     pub fn raw_consensus_node_key(&self) -> anyhow::Result<String> {
@@ -67,7 +72,7 @@ impl SecretsConfig {
 pub struct SecretsConfigPatch(PatchedConfig);
 
 impl SecretsConfigPatch {
-    pub fn empty(shell: &Shell, path: PathBuf) -> Self {
+    pub fn empty(shell: &Shell, path: &Path) -> Self {
         Self(PatchedConfig::empty(shell, path))
     }
 
@@ -96,6 +101,12 @@ impl SecretsConfigPatch {
     pub fn set_avail_secrets(&mut self, secrets: &AvailSecrets) -> anyhow::Result<()> {
         self.0.insert_yaml("da_client", secrets)?;
         self.0.insert("da_client.client", "Avail")
+    }
+
+    // SYSCOIN: write Bitcoin DA secrets
+    pub fn set_bitcoin_secrets(&mut self, secrets: &BitcoinSecrets) -> anyhow::Result<()> {
+        self.0.insert_yaml("da_client", secrets)?;
+        self.0.insert("da_client.client", "Bitcoin")
     }
 
     pub fn set_consensus_keys(&mut self, consensus_keys: RawConsensusKeys) -> anyhow::Result<()> {

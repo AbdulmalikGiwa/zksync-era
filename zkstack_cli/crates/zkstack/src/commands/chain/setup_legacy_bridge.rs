@@ -9,7 +9,7 @@ use zkstack_cli_config::{
         script_params::SETUP_LEGACY_BRIDGE, setup_legacy_bridge::SetupLegacyBridgeInput,
     },
     traits::SaveConfig,
-    ChainConfig, ContractsConfig, EcosystemConfig,
+    ChainConfig, ContractsConfig, EcosystemConfig, ZkStackConfigTrait,
 };
 
 use crate::{
@@ -50,10 +50,10 @@ pub async fn setup_legacy_bridge(
         create2factory_salt: contracts_config.create2_factory_salt,
         create2factory_addr: contracts_config.create2_factory_addr,
     };
-    let foundry_contracts_path = chain_config.path_to_l1_foundry();
+    let foundry_contracts_path = chain_config.path_to_foundry_scripts();
     input.save(
         shell,
-        SETUP_LEGACY_BRIDGE.input(&chain_config.path_to_l1_foundry()),
+        SETUP_LEGACY_BRIDGE.input(&chain_config.path_to_foundry_scripts()),
     )?;
     let secrets = chain_config.get_secrets_config().await?;
 
@@ -61,7 +61,8 @@ pub async fn setup_legacy_bridge(
         .script(&SETUP_LEGACY_BRIDGE.script(), forge_args.clone())
         .with_ffi()
         .with_rpc_url(secrets.l1_rpc_url()?)
-        .with_broadcast();
+        .with_broadcast()
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
 
     forge = fill_forge_private_key(
         forge,

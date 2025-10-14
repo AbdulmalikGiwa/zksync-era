@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use zksync_config::{GasAdjusterConfig, GenesisConfig};
+use zksync_dal::node::{MasterPool, PoolResource};
 use zksync_node_framework::{
     service::StopReceiver,
     task::{Task, TaskId},
@@ -11,7 +12,6 @@ use zksync_node_framework::{
 use zksync_shared_resources::PubdataSendingModeResource;
 use zksync_web3_decl::node::SettlementLayerClient;
 
-use super::resources::GasAdjusterResource;
 use crate::l1_gas_price::GasAdjuster;
 
 /// Wiring layer for sequencer L1 gas interfaces.
@@ -24,16 +24,17 @@ pub struct GasAdjusterLayer {
 
 #[derive(Debug, FromContext)]
 pub struct Input {
-    pub client: SettlementLayerClient,
-    pub pubdata_sending_mode: PubdataSendingModeResource,
+    client: SettlementLayerClient,
+    pubdata_sending_mode: PubdataSendingModeResource,
+    master_pool: PoolResource<MasterPool>,
 }
 
 #[derive(Debug, IntoContext)]
 pub struct Output {
-    pub gas_adjuster: GasAdjusterResource,
+    gas_adjuster: Arc<GasAdjuster>,
     /// Only runs if someone uses the resources listed above.
     #[context(task)]
-    pub gas_adjuster_task: GasAdjusterTask,
+    gas_adjuster_task: GasAdjusterTask,
 }
 
 impl GasAdjusterLayer {
@@ -57,7 +58,7 @@ impl WiringLayer for GasAdjusterLayer {
     async fn wire(self, input: Self::Input) -> Result<Self::Output, WiringError> {
         let client = match input.client {
             SettlementLayerClient::L1(client) => client.into(),
-            SettlementLayerClient::L2(client) => client.into(),
+            SettlementLayerClient::Gateway(client) => client.into(),
         };
 
         let adjuster = GasAdjuster::new(
@@ -65,13 +66,18 @@ impl WiringLayer for GasAdjusterLayer {
             self.gas_adjuster_config,
             input.pubdata_sending_mode.0,
             self.genesis_config.l1_batch_commit_data_generator_mode,
+            input
+                .master_pool
+                .get()
+                .await
+                .expect("Failed to get connection pool"),
         )
         .await
         .context("GasAdjuster::new()")?;
         let gas_adjuster = Arc::new(adjuster);
 
         Ok(Output {
-            gas_adjuster: gas_adjuster.clone().into(),
+            gas_adjuster: gas_adjuster.clone(),
             gas_adjuster_task: GasAdjusterTask { gas_adjuster },
         })
     }

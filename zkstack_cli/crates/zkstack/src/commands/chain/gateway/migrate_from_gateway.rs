@@ -15,7 +15,6 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use xshell::Shell;
 use zkstack_cli_common::{
-    config::global_config,
     ethereum::{get_ethers_provider, get_zk_client},
     forge::{Forge, ForgeScriptArgs},
     logger,
@@ -24,7 +23,7 @@ use zkstack_cli_common::{
     zks_provider::{FinalizeWithdrawalParams, ZKSProvider},
 };
 use zkstack_cli_config::{
-    forge_interface::script_params::GATEWAY_UTILS_SCRIPT_PATH, EcosystemConfig,
+    forge_interface::script_params::GATEWAY_UTILS_SCRIPT_PATH, ZkStackConfig, ZkStackConfigTrait,
 };
 use zksync_basic_types::{H256, U256};
 use zksync_web3_decl::{
@@ -39,9 +38,10 @@ use crate::{
         admin_call_builder::AdminCallBuilder,
         gateway::{
             constants::DEFAULT_MAX_L1_GAS_PRICE_FOR_PRIORITY_TXS,
-            gateway_common::{extract_and_wait_for_priority_ops, send_tx},
+            gateway_common::extract_and_wait_for_priority_ops,
         },
         init::get_l1_da_validator,
+        utils::send_tx,
     },
     messages::{MSG_CHAIN_NOT_INITIALIZED, MSG_DA_PAIR_REGISTRATION_SPINNER},
     utils::forge::{check_the_balance, fill_forge_private_key, WalletOwner},
@@ -68,11 +68,10 @@ lazy_static! {
 }
 
 pub async fn run(args: MigrateFromGatewayArgs, shell: &Shell) -> anyhow::Result<()> {
-    let ecosystem_config = EcosystemConfig::from_file(shell)?;
+    let ecosystem_config = ZkStackConfig::ecosystem(shell)?;
 
-    let chain_name = global_config().chain_name.clone();
     let chain_config = ecosystem_config
-        .load_chain(chain_name)
+        .load_current_chain()
         .context(MSG_CHAIN_NOT_INITIALIZED)?;
 
     let gateway_chain_config = ecosystem_config
@@ -91,7 +90,7 @@ pub async fn run(args: MigrateFromGatewayArgs, shell: &Shell) -> anyhow::Result<
     let start_migrate_from_gateway_call = start_migrate_chain_from_gateway(
         shell,
         &args.forge_args,
-        &ecosystem_config.path_to_l1_foundry(),
+        &ecosystem_config.path_to_foundry_scripts(),
         crate::admin_functions::AdminScriptMode::OnlySave,
         chain_contracts_config
             .ecosystem_contracts
@@ -171,7 +170,7 @@ pub async fn run(args: MigrateFromGatewayArgs, shell: &Shell) -> anyhow::Result<
     finish_migrate_chain_from_gateway(
         shell,
         args.forge_args.clone(),
-        &ecosystem_config.path_to_l1_foundry(),
+        &ecosystem_config.path_to_foundry_scripts(),
         ecosystem_config
             .get_wallets()?
             .deployer
@@ -195,7 +194,7 @@ pub async fn run(args: MigrateFromGatewayArgs, shell: &Shell) -> anyhow::Result<
     set_da_validator_pair(
         shell,
         &args.forge_args,
-        &ecosystem_config.path_to_l1_foundry(),
+        &ecosystem_config.path_to_foundry_scripts(),
         crate::admin_functions::AdminScriptMode::Broadcast(
             chain_config.get_wallets_config()?.governor,
         ),
@@ -304,7 +303,8 @@ pub(crate) async fn finish_migrate_chain_from_gateway(
         .with_ffi()
         .with_rpc_url(l1_rpc_url)
         .with_broadcast()
-        .with_calldata(&data);
+        .with_calldata(&data)
+        .with_timeout(1800); // SYSCOIN 30 minutes timeout for transaction receipts
 
     // Governor private key is required for this script
     forge = fill_forge_private_key(forge, Some(&wallet), WalletOwner::Deployer)?;

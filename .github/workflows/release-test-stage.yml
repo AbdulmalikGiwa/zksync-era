@@ -23,7 +23,7 @@ jobs:
 
       - name: Get all test, doc and src files that have changed
         id: changed-files-yaml
-        uses: tj-actions/changed-files@48566bbcc22ceb7c5809ebdd27377309f2c3de8c # v39
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
         with:
           files_yaml: |
             # TODO: make it more granular, as already implemented in CI workflow
@@ -39,7 +39,7 @@ jobs:
               - '!prover/**'
   setup:
     name: Setup
-    runs-on: [matterlabs-deployer-stage]
+    runs-on: [ubuntu-latest]
     outputs:
       image_tag_suffix: ${{ steps.generate-tag-suffix.outputs.image_tag_suffix }}
       prover_fri_gpu_key_id: ${{ steps.extract-prover-fri-setup-key-ids.outputs.gpu_short_commit_sha }}
@@ -69,16 +69,6 @@ jobs:
     secrets:
       DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
-  build-push-tee-prover-images:
-    name: Build and push images
-    needs: [setup, changed_files]
-    uses: ./.github/workflows/build-tee-prover-template.yml
-    if: needs.changed_files.outputs.core == 'true' || needs.changed_files.outputs.all == 'true'
-    with:
-      image_tag_suffix: ${{ needs.setup.outputs.image_tag_suffix }}
-    secrets:
-      ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
 
   build-push-contract-verifier:
     name: Build and push images

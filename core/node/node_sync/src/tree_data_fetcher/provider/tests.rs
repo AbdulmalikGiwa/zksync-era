@@ -42,13 +42,20 @@ fn mock_block_details_base(number: u32, hash: Option<H256>) -> api::BlockDetails
         status: api::BlockStatus::Sealed,
         commit_tx_hash: None,
         committed_at: None,
+        commit_tx_finality: None,
         commit_chain_id: None,
         prove_tx_hash: None,
+        prove_tx_finality: None,
         proven_at: None,
         prove_chain_id: None,
         execute_tx_hash: None,
+        execute_tx_finality: None,
         executed_at: None,
         execute_chain_id: None,
+        precommit_tx_hash: None,
+        precommit_tx_finality: None,
+        precommitted_at: None,
+        precommit_chain_id: None,
         l1_gas_price: 10,
         l2_fair_gas_price: 100,
         fair_pubdata_price: None,
@@ -71,6 +78,7 @@ impl L2Parameters {
             .method("zks_getL1BatchDetails", move |number: L1BatchNumber| {
                 let root_hash = self.l1_batch_root_hashes.get(number.0 as usize);
                 Ok(root_hash.map(|&hash| api::L1BatchDetails {
+                    commitment: root_hash.copied(),
                     number,
                     base: mock_block_details_base(number.0, Some(hash)),
                 }))

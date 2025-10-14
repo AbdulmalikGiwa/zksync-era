@@ -5,6 +5,7 @@ use itertools::Itertools;
 use tokio::{sync::watch, task::JoinHandle};
 use zksync_dal::{ConnectionPool, Core, CoreDal};
 use zksync_health_check::{Health, HealthStatus, HealthUpdater, ReactiveHealthCheck};
+use zksync_instrument::alloc::AllocationGuard;
 use zksync_l1_contract_interface::i_executor::commit::kzg::pubdata_to_blob_commitments;
 use zksync_multivm::zk_evm_latest::ethereum_types::U256;
 use zksync_types::{
@@ -42,16 +43,18 @@ pub struct CommitmentGenerator {
     connection_pool: ConnectionPool<Core>,
     health_updater: HealthUpdater,
     parallelism: NonZeroU32,
+    disable_sanity_checks: bool,
 }
 
 impl CommitmentGenerator {
     /// Creates a commitment generator with the provided mode.
-    pub fn new(connection_pool: ConnectionPool<Core>) -> Self {
+    pub fn new(connection_pool: ConnectionPool<Core>, disable_sanity_checks: bool) -> Self {
         Self {
             computer: Arc::new(RealCommitmentComputer),
             connection_pool,
             health_updater: ReactiveHealthCheck::new("commitment_generator").1,
             parallelism: Self::default_parallelism(),
+            disable_sanity_checks,
         }
     }
 
@@ -104,8 +107,11 @@ impl CommitmentGenerator {
         drop(connection);
 
         let computer = self.computer.clone();
+        let span = tracing::Span::current();
         let events_commitment_task: JoinHandle<anyhow::Result<H256>> =
             tokio::task::spawn_blocking(move || {
+                let _entered_span = span.entered();
+                let _guard = AllocationGuard::for_operation("commitment_generator#events");
                 let latency = METRICS.events_queue_commitment_latency.start();
                 let events_queue_commitment =
                     computer.events_queue_commitment(&events_queue, protocol_version)?;
@@ -115,8 +121,12 @@ impl CommitmentGenerator {
             });
 
         let computer = self.computer.clone();
+        let span = tracing::Span::current();
         let bootloader_memory_commitment_task: JoinHandle<anyhow::Result<H256>> =
             tokio::task::spawn_blocking(move || {
+                let _entered_span = span.entered();
+                let _guard =
+                    AllocationGuard::for_operation("commitment_generator#bootloader_memory");
                 let latency = METRICS.bootloader_content_commitment_latency.start();
                 let bootloader_initial_content_commitment = computer
                     .bootloader_initial_content_commitment(
@@ -329,9 +339,9 @@ impl CommitmentGenerator {
 
         let latency =
             METRICS.generate_commitment_latency_stage[&CommitmentStage::Calculate].start();
-        let mut commitment = L1BatchCommitment::new(input);
+        let mut commitment = L1BatchCommitment::new(input, self.disable_sanity_checks)?;
         self.post_process_commitment(&mut commitment, commitment_mode);
-        let artifacts = commitment.artifacts();
+        let artifacts = commitment.artifacts()?;
         let latency = latency.observe();
         tracing::debug!(
             "Generated commitment artifacts for L1 batch #{l1_batch_number} in {latency:?}"

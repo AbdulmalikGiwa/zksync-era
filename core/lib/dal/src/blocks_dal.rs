@@ -6,17 +6,20 @@ use std::{
 };
 
 use anyhow::Context as _;
-use bigdecimal::{BigDecimal, FromPrimitive};
+use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use sqlx::types::chrono::{DateTime, Utc};
 use zksync_db_connection::{
     connection::Connection,
     error::{DalResult, SqlxContext},
     instrument::{InstrumentExt, Instrumented},
+    interpolate_query, match_query_as,
 };
 use zksync_types::{
-    aggregated_operations::AggregatedActionType,
+    aggregated_operations::{
+        AggregatedActionType, L1BatchAggregatedActionType, L2BlockAggregatedActionType,
+    },
     block::{
-        CommonL1BatchHeader, L1BatchHeader, L1BatchStatistics, L1BatchTreeData, L2BlockHeader,
+        CommonBlockStatistics, CommonL1BatchHeader, L1BatchHeader, L1BatchTreeData, L2BlockHeader,
         StorageOracleInfo, UnsealedL1BatchHeader,
     },
     commitment::{L1BatchCommitmentArtifacts, L1BatchWithMetadata, PubdataParams},
@@ -34,6 +37,7 @@ use crate::{
             CommonStorageL1BatchHeader, StorageL1Batch, StorageL1BatchHeader, StorageL2BlockHeader,
             StoragePubdataParams, UnsealedStorageL1Batch,
         },
+        storage_eth_tx::L2BlockWithEthTx,
         storage_event::StorageL2ToL1Log,
         storage_oracle_info::DbStorageOracleInfo,
     },
@@ -43,6 +47,15 @@ use crate::{
 #[derive(Debug)]
 pub struct BlocksDal<'a, 'c> {
     pub(crate) storage: &'a mut Connection<'c, Core>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TxForPrecommit {
+    pub l1_batch_number: Option<L1BatchNumber>,
+    pub l2block_number: L2BlockNumber,
+    pub timestamp: i64,
+    pub tx_hash: H256,
+    pub is_success: bool,
 }
 
 impl BlocksDal<'_, '_> {
@@ -123,6 +136,31 @@ impl BlocksDal<'_, '_> {
         Ok(row.number.map(|num| L1BatchNumber(num as u32)))
     }
 
+    /// Returns the number and the timestamp of the last sealed L1 batch present in the DB, or `None` if there are no L1 batches.
+    pub async fn get_sealed_l1_batch_number_and_timestamp(
+        &mut self,
+    ) -> DalResult<Option<(L1BatchNumber, u64)>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                number,
+                timestamp
+            FROM
+                l1_batches
+            WHERE
+                is_sealed
+            ORDER BY number DESC
+            LIMIT 1
+            "#
+        )
+        .instrument("get_sealed_l1_batch_number_and_timestamp")
+        .report_latency()
+        .fetch_optional(self.storage)
+        .await?;
+
+        Ok(row.map(|row| (L1BatchNumber(row.number as u32), row.timestamp as u64)))
+    }
+
     /// Returns latest L1 batch's header (could be unsealed). The header contains fields that are
     /// common for both unsealed and sealed batches. Returns `None` if there are no L1 batches.
     pub async fn get_latest_l1_batch_header(&mut self) -> DalResult<Option<CommonL1BatchHeader>> {
@@ -137,7 +175,8 @@ impl BlocksDal<'_, '_> {
                 fee_address,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM
                 l1_batches
             ORDER BY
@@ -147,6 +186,41 @@ impl BlocksDal<'_, '_> {
             "#,
         )
         .instrument("get_latest_l1_batch_header")
+        .fetch_optional(self.storage)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(header.into()))
+    }
+
+    /// Returns common L1 batch's header (could be unsealed) by L1 batch number. The header contains fields that are
+    /// common for both unsealed and sealed batches. Returns `None` if there is no L1 batch with the provided number.
+    pub async fn get_common_l1_batch_header(
+        &mut self,
+        number: L1BatchNumber,
+    ) -> DalResult<Option<CommonL1BatchHeader>> {
+        let Some(header) = sqlx::query_as!(
+            CommonStorageL1BatchHeader,
+            r#"
+            SELECT
+                number,
+                is_sealed,
+                timestamp,
+                protocol_version,
+                fee_address,
+                l1_gas_price,
+                l2_fair_gas_price,
+                fair_pubdata_price,
+                pubdata_limit
+            FROM
+                l1_batches
+            WHERE number = $1
+            "#,
+            i64::from(number.0),
+        )
+        .instrument("get_common_l1_batch_header")
         .fetch_optional(self.storage)
         .await?
         else {
@@ -266,6 +340,27 @@ impl BlocksDal<'_, '_> {
         Ok(row.number.map(|num| L1BatchNumber(num as u32)))
     }
 
+    pub async fn get_last_l1_batch_number_with_commitment(
+        &mut self,
+    ) -> DalResult<Option<L1BatchNumber>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                MAX(number) AS "number"
+            FROM
+                l1_batches
+            WHERE
+                commitment IS NOT NULL
+            "#
+        )
+        .instrument("get_last_l1_batch_number_with_commitment")
+        .report_latency()
+        .fetch_one(self.storage)
+        .await?;
+
+        Ok(row.number.map(|num| L1BatchNumber(num as u32)))
+    }
+
     /// Gets a number of the earliest L1 batch that is ready for commitment generation (i.e., doesn't have commitment
     /// yet, and has tree data).
     pub async fn get_next_l1_batch_ready_for_commitment_generation(
@@ -292,6 +387,35 @@ impl BlocksDal<'_, '_> {
         .await?;
 
         Ok(row.map(|row| L1BatchNumber(row.number as u32)))
+    }
+
+    /// Gets a number of the earliest L1 batch that is ready for commitment generation (i.e., doesn't have commitment
+    /// yet, and has tree data).
+    pub async fn get_commitment_for_l1_batch(
+        &mut self,
+        l1_batch_number: L1BatchNumber,
+    ) -> DalResult<Option<H256>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                commitment AS "commitment!"
+            FROM
+                l1_batches
+            WHERE
+                number = $1 AND commitment IS NOT NULL
+            ORDER BY
+                number
+            LIMIT
+                1
+            "#,
+            i64::from(l1_batch_number.0)
+        )
+        .instrument("get_next_l1_batch_ready_for_commitment_generation")
+        .report_latency()
+        .fetch_optional(self.storage)
+        .await?;
+
+        Ok(row.map(|row| H256::from_slice(row.commitment.as_ref())))
     }
 
     /// Gets a number of the last L1 batch that is ready for commitment generation (i.e., doesn't have commitment
@@ -322,9 +446,32 @@ impl BlocksDal<'_, '_> {
         Ok(row.map(|row| L1BatchNumber(row.number as u32)))
     }
 
+    pub async fn get_last_miniblock_with_precommit(&mut self) -> DalResult<Option<L2BlockNumber>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                number
+            FROM
+                miniblocks
+            WHERE
+                eth_precommit_tx_id IS NOT NULL
+            ORDER BY
+                number DESC
+            LIMIT
+                1
+            "#
+        )
+        .instrument("get_last_miniblock_with_precommit")
+        .report_latency()
+        .fetch_optional(self.storage)
+        .await?;
+
+        Ok(row.map(|row| L2BlockNumber(row.number as u32)))
+    }
+
     /// Returns the number of the earliest L1 batch with metadata (= state hash) present in the DB,
     /// or `None` if there are no such L1 batches.
-    pub async fn get_earliest_l1_batch_number_with_metadata(
+    pub async fn get_earliest_l1_batch_number_with_commitment(
         &mut self,
     ) -> DalResult<Option<L1BatchNumber>> {
         let row = sqlx::query!(
@@ -334,7 +481,7 @@ impl BlocksDal<'_, '_> {
             FROM
                 l1_batches
             WHERE
-                hash IS NOT NULL
+                commitment IS NOT NULL
             "#
         )
         .instrument("get_earliest_l1_batch_number_with_metadata")
@@ -345,10 +492,42 @@ impl BlocksDal<'_, '_> {
         Ok(row.number.map(|num| L1BatchNumber(num as u32)))
     }
 
+    pub async fn get_l2_blocks_statistics_for_eth_tx_id(
+        &mut self,
+        eth_tx_id: u32,
+    ) -> DalResult<Vec<CommonBlockStatistics>> {
+        Ok(sqlx::query!(
+            r#"
+            SELECT
+                number,
+                l1_tx_count,
+                l2_tx_count,
+                timestamp
+            FROM
+                miniblocks
+            WHERE
+                eth_precommit_tx_id = $1
+            "#,
+            eth_tx_id as i32
+        )
+        .instrument("get_l1_batch_statistics_for_eth_tx_id")
+        .with_arg("eth_tx_id", &eth_tx_id)
+        .fetch_all(self.storage)
+        .await?
+        .into_iter()
+        .map(|row| CommonBlockStatistics {
+            number: row.number as u32,
+            timestamp: row.timestamp as u64,
+            l2_tx_count: row.l2_tx_count as u32,
+            l1_tx_count: row.l1_tx_count as u32,
+        })
+        .collect())
+    }
+
     pub async fn get_l1_batches_statistics_for_eth_tx_id(
         &mut self,
         eth_tx_id: u32,
-    ) -> DalResult<Vec<L1BatchStatistics>> {
+    ) -> DalResult<Vec<CommonBlockStatistics>> {
         Ok(sqlx::query!(
             r#"
             SELECT
@@ -370,8 +549,8 @@ impl BlocksDal<'_, '_> {
         .fetch_all(self.storage)
         .await?
         .into_iter()
-        .map(|row| L1BatchStatistics {
-            number: L1BatchNumber(row.number as u32),
+        .map(|row| CommonBlockStatistics {
+            number: row.number as u32,
             timestamp: row.timestamp as u64,
             l2_tx_count: row.l2_tx_count as u32,
             l1_tx_count: row.l1_tx_count as u32,
@@ -421,7 +600,8 @@ impl BlocksDal<'_, '_> {
                 data_availability.inclusion_data,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM
                 l1_batches
             LEFT JOIN commitments ON commitments.l1_batch_number = l1_batches.number
@@ -465,7 +645,8 @@ impl BlocksDal<'_, '_> {
                 fee_address,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM
                 l1_batches
             WHERE
@@ -549,14 +730,122 @@ impl BlocksDal<'_, '_> {
         Ok(storage_oracle_info.and_then(DbStorageOracleInfo::into_optional_batch_oracle_info))
     }
 
-    pub async fn set_eth_tx_id(
+    /// Get Last L2 blocks in batch with their rolling txs hash and precommit eth transactions ids,
+    /// grouped by batches.
+    pub async fn get_last_l2_block_rolling_txs_hashes_by_batches(
+        &mut self,
+    ) -> DalResult<HashMap<L1BatchNumber, Vec<L2BlockWithEthTx>>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                l1_batches.number AS l1_batch_number,
+                miniblocks.eth_precommit_tx_id,
+                miniblocks.rolling_txs_hash AS "rolling_txs_hash!",
+                miniblocks.number AS miniblock_number
+            FROM
+                l1_batches
+            JOIN LATERAL (
+                SELECT
+                    eth_precommit_tx_id,
+                    rolling_txs_hash,
+                    number
+                FROM miniblocks
+                LEFT JOIN
+                    eth_txs_history
+                    ON eth_txs_history.eth_tx_id = miniblocks.eth_precommit_tx_id
+                WHERE
+                    l1_batch_number = l1_batches.number
+                    AND (
+                        eth_txs_history.finality_status != 'pending'
+                        OR eth_precommit_tx_id IS NULL
+                    )
+                ORDER BY number DESC
+                LIMIT 2
+            ) miniblocks ON TRUE
+            WHERE
+                l1_batches.number > 0
+                AND l1_batches.is_sealed
+                AND l1_batches.eth_commit_tx_id IS NULL
+                AND l1_batches.final_precommit_eth_tx_id IS NULL
+                AND miniblocks.rolling_txs_hash IS NOT NULL
+            ORDER BY l1_batches.number, miniblocks.number DESC;
+            "#
+        )
+        .instrument("get_last_l2_block_rolling_txs_hashes_by_batches")
+        .report_latency()
+        .fetch_all(self.storage)
+        .await?;
+
+        // Group by l1_batch_number
+        let mut l2_blocks_by_batch: HashMap<_, Vec<_>> = HashMap::new();
+        for row in rows {
+            l2_blocks_by_batch
+                .entry(L1BatchNumber(row.l1_batch_number as u32))
+                .or_default()
+                .push(L2BlockWithEthTx {
+                    l1_batch_number: L1BatchNumber(row.l1_batch_number as u32),
+                    l2_block_number: L2BlockNumber(row.miniblock_number as u32),
+                    rolling_txs_hash: H256::from_slice(&row.rolling_txs_hash),
+                    precommit_eth_tx_id: row.eth_precommit_tx_id,
+                });
+        }
+
+        Ok(l2_blocks_by_batch)
+    }
+
+    pub async fn set_eth_tx_id_for_l2_blocks(
+        &mut self,
+        number_range: ops::RangeInclusive<L2BlockNumber>,
+        eth_tx_id: u32,
+        aggregation_type: L2BlockAggregatedActionType,
+    ) -> DalResult<()> {
+        match aggregation_type {
+            L2BlockAggregatedActionType::Precommit => {
+                let instrumentation = Instrumented::new("set_eth_tx_id#precommit")
+                    .with_arg("number_range", &number_range)
+                    .with_arg("eth_tx_id", &eth_tx_id);
+
+                let query = sqlx::query!(
+                    r#"
+                    UPDATE miniblocks
+                    SET
+                        eth_precommit_tx_id = $1,
+                        updated_at = NOW()
+                    WHERE
+                        number BETWEEN $2 AND $3
+                        AND eth_precommit_tx_id IS NULL
+                    "#,
+                    eth_tx_id as i32,
+                    i64::from(number_range.start().0),
+                    i64::from(number_range.end().0)
+                );
+                let result = instrumentation
+                    .clone()
+                    .with(query)
+                    .execute(self.storage)
+                    .await?;
+
+                if result.rows_affected() as u32
+                    != number_range.end().0 - number_range.start().0 + 1
+                {
+                    let err = instrumentation.constraint_error(anyhow::anyhow!(
+                        "Update eth_precommit_tx_id that is is not null is not allowed"
+                    ));
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn set_eth_tx_id_for_l1_batches(
         &mut self,
         number_range: ops::RangeInclusive<L1BatchNumber>,
         eth_tx_id: u32,
         aggregation_type: AggregatedActionType,
     ) -> DalResult<()> {
         match aggregation_type {
-            AggregatedActionType::Commit => {
+            AggregatedActionType::L1Batch(L1BatchAggregatedActionType::Commit) => {
                 let instrumentation = Instrumented::new("set_eth_tx_id#commit")
                     .with_arg("number_range", &number_range)
                     .with_arg("eth_tx_id", &eth_tx_id);
@@ -588,7 +877,7 @@ impl BlocksDal<'_, '_> {
                     return Err(err);
                 }
             }
-            AggregatedActionType::PublishProofOnchain => {
+            AggregatedActionType::L1Batch(L1BatchAggregatedActionType::PublishProofOnchain) => {
                 let instrumentation = Instrumented::new("set_eth_tx_id#prove")
                     .with_arg("number_range", &number_range)
                     .with_arg("eth_tx_id", &eth_tx_id);
@@ -620,7 +909,7 @@ impl BlocksDal<'_, '_> {
                     return Err(err);
                 }
             }
-            AggregatedActionType::Execute => {
+            AggregatedActionType::L1Batch(L1BatchAggregatedActionType::Execute) => {
                 let instrumentation = Instrumented::new("set_eth_tx_id#execute")
                     .with_arg("number_range", &number_range)
                     .with_arg("eth_tx_id", &eth_tx_id);
@@ -653,6 +942,39 @@ impl BlocksDal<'_, '_> {
                     return Err(err);
                 }
             }
+            AggregatedActionType::L2Block(L2BlockAggregatedActionType::Precommit) => {
+                let instrumentation = Instrumented::new("set_eth_tx_id#precommit")
+                    .with_arg("number_range", &number_range)
+                    .with_arg("eth_tx_id", &eth_tx_id);
+
+                let query = sqlx::query!(
+                    r#"
+                    UPDATE l1_batches
+                    SET
+                        final_precommit_eth_tx_id = $1,
+                        updated_at = NOW()
+                    WHERE
+                        number BETWEEN $2 AND $3
+                        AND final_precommit_eth_tx_id IS NULL
+                    "#,
+                    eth_tx_id as i32,
+                    i64::from(number_range.start().0),
+                    i64::from(number_range.end().0)
+                );
+
+                let result = instrumentation
+                    .clone()
+                    .with(query)
+                    .execute(self.storage)
+                    .await?;
+
+                if result.rows_affected() == 0 {
+                    let err = instrumentation.constraint_error(anyhow::anyhow!(
+                        "Update final_precommit_eth_tx_id that is is not null is not allowed"
+                    ));
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
@@ -681,6 +1003,7 @@ impl BlocksDal<'_, '_> {
                 l1_gas_price,
                 l2_fair_gas_price,
                 fair_pubdata_price,
+                pubdata_limit,
                 l1_tx_count,
                 l2_tx_count,
                 bloom,
@@ -700,6 +1023,7 @@ impl BlocksDal<'_, '_> {
                 $5,
                 $6,
                 $7,
+                $8,
                 0,
                 0,
                 ''::bytea,
@@ -718,6 +1042,7 @@ impl BlocksDal<'_, '_> {
             unsealed_batch_header.fee_input.l1_gas_price() as i64,
             unsealed_batch_header.fee_input.fair_l2_gas_price() as i64,
             unsealed_batch_header.fee_input.fair_pubdata_price() as i64,
+            unsealed_batch_header.pubdata_limit.map(|l| l as i64),
         )
         .instrument("insert_l1_batch")
         .with_arg("number", &unsealed_batch_header.number)
@@ -756,6 +1081,81 @@ impl BlocksDal<'_, '_> {
         Ok(())
     }
 
+    pub async fn get_ready_for_precommit_txs(
+        &mut self,
+        l1_batch: L1BatchNumber,
+    ) -> DalResult<Vec<TxForPrecommit>> {
+        let mut tx = self.storage.start_transaction().await?;
+        // Miniblocks belongs to the non sealed batches don't have batch number,
+        // so for the pending batch we use NULl
+        let txs = sqlx::query!(
+            r#"
+            SELECT
+                miniblocks.l1_batch_number,
+                transactions.hash, transactions.error,
+                miniblock_number AS "miniblock_number!",
+                miniblocks.timestamp
+            FROM miniblocks
+            JOIN transactions ON miniblocks.number = transactions.miniblock_number
+            WHERE
+                (
+                    miniblocks.l1_batch_number IS NULL
+                    OR miniblocks.l1_batch_number = $1
+                )
+                AND
+                miniblocks.rolling_txs_hash IS NOT NULL
+                AND
+                miniblocks.eth_precommit_tx_id IS NULL
+            ORDER BY miniblock_number, index_in_block
+            "#,
+            i64::from(l1_batch.0)
+        )
+        .instrument("get_ready_for_precommit_txs")
+        .report_latency()
+        .fetch_all(&mut tx)
+        .await?
+        .into_iter()
+        .map(|row| TxForPrecommit {
+            l1_batch_number: row.l1_batch_number.map(|a| L1BatchNumber(a as u32)),
+            l2block_number: L2BlockNumber(row.miniblock_number as u32),
+            timestamp: row.timestamp,
+            tx_hash: H256::from_slice(&row.hash),
+            is_success: row.error.is_none(),
+        })
+        .collect();
+
+        Ok(txs)
+    }
+
+    pub async fn any_precommit_txs_after_batch(
+        &mut self,
+        l1_batch: L1BatchNumber,
+    ) -> DalResult<bool> {
+        let mut tx = self.storage.start_transaction().await?;
+        let block_number = sqlx::query!(
+            r#"
+            SELECT
+                number
+            FROM miniblocks
+            WHERE
+                (
+                    l1_batch_number > $1
+                    OR
+                    l1_batch_number IS NULL
+                )
+                AND
+                eth_precommit_tx_id IS NOT NULL
+            LIMIT 1
+            "#,
+            i64::from(l1_batch.0)
+        )
+        .instrument("precommit_txs_after_l1_batch")
+        .report_latency()
+        .fetch_optional(&mut tx)
+        .await?;
+        Ok(block_number.is_some())
+    }
+
     /// Marks provided L1 batch as sealed and populates it with all the runtime information.
     ///
     /// Errors if the batch does not exist.
@@ -766,6 +1166,7 @@ impl BlocksDal<'_, '_> {
         storage_refunds: &[u32],
         pubdata_costs: &[i32],
         predicted_circuits_by_type: CircuitStatistic, // predicted number of circuits for each circuit type
+        bytes_per_blob: u64,
     ) -> anyhow::Result<()> {
         let initial_bootloader_contents_len = initial_bootloader_contents.len();
         let instrumentation = Instrumented::new("mark_l1_batch_as_sealed")
@@ -793,6 +1194,12 @@ impl BlocksDal<'_, '_> {
         let storage_refunds: Vec<_> = storage_refunds.iter().copied().map(i64::from).collect();
         let pubdata_costs: Vec<_> = pubdata_costs.iter().copied().map(i64::from).collect();
 
+        let blobs_amount = pubdata_input
+            .clone()
+            .map(|input| input.len() as u64)
+            .unwrap_or(0)
+            .div_ceil(bytes_per_blob);
+
         let query = sqlx::query!(
             r#"
             UPDATE l1_batches
@@ -813,6 +1220,7 @@ impl BlocksDal<'_, '_> {
                 pubdata_costs = $15,
                 pubdata_input = $16,
                 predicted_circuits_by_type = $17,
+                blobs_amount = $18,
                 updated_at = NOW(),
                 sealed_at = NOW(),
                 is_sealed = TRUE
@@ -840,6 +1248,7 @@ impl BlocksDal<'_, '_> {
             &pubdata_costs,
             pubdata_input,
             serde_json::to_value(predicted_circuits_by_type).unwrap(),
+            blobs_amount as i64,
         );
         let update_result = instrumentation.with(query).execute(self.storage).await?;
 
@@ -851,6 +1260,29 @@ impl BlocksDal<'_, '_> {
         }
 
         Ok(())
+    }
+
+    pub async fn get_blobs_amount_for_range(
+        &mut self,
+        lower_bound: L1BatchNumber,
+        upper_bound: L1BatchNumber,
+    ) -> DalResult<u64> {
+        let result: u64 = sqlx::query!(
+            r#"
+            SELECT SUM(blobs_amount) FROM l1_batches WHERE number BETWEEN $1 AND $2
+            "#,
+            i64::from(lower_bound.0),
+            i64::from(upper_bound.0)
+        )
+        .instrument("get_blobs_amount_for_range")
+        .fetch_optional(self.storage)
+        .await?
+        .map(|r| r.sum)
+        .unwrap()
+        .map(|x| x.to_i64().unwrap() as u64)
+        .unwrap_or(0);
+
+        Ok(result)
     }
 
     pub async fn get_unsealed_l1_batch(&mut self) -> DalResult<Option<UnsealedL1BatchHeader>> {
@@ -870,7 +1302,8 @@ impl BlocksDal<'_, '_> {
                 fee_address,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM (
                 SELECT
                     number,
@@ -880,6 +1313,7 @@ impl BlocksDal<'_, '_> {
                     l1_gas_price,
                     l2_fair_gas_price,
                     fair_pubdata_price,
+                    pubdata_limit,
                     is_sealed
                 FROM l1_batches
                 ORDER BY number DESC
@@ -931,6 +1365,7 @@ impl BlocksDal<'_, '_> {
                 logs_bloom,
                 l2_da_validator_address,
                 pubdata_type,
+                rolling_txs_hash,
                 created_at,
                 updated_at
             )
@@ -956,6 +1391,7 @@ impl BlocksDal<'_, '_> {
                 $18,
                 $19,
                 $20,
+                $21,
                 NOW(),
                 NOW()
             )
@@ -993,6 +1429,9 @@ impl BlocksDal<'_, '_> {
                 .l2_da_validator_address
                 .as_bytes(),
             l2_block_header.pubdata_params.pubdata_type.to_string(),
+            l2_block_header
+                .rolling_txs_hash
+                .map(|h| h.as_bytes().to_vec())
         );
 
         instrumentation.with(query).execute(self.storage).await?;
@@ -1023,7 +1462,8 @@ impl BlocksDal<'_, '_> {
                 gas_limit,
                 logs_bloom,
                 l2_da_validator_address,
-                pubdata_type
+                pubdata_type,
+                rolling_txs_hash
             FROM
                 miniblocks
             ORDER BY
@@ -1066,7 +1506,8 @@ impl BlocksDal<'_, '_> {
                 gas_limit,
                 logs_bloom,
                 l2_da_validator_address,
-                pubdata_type
+                pubdata_type,
+                rolling_txs_hash
             FROM
                 miniblocks
             WHERE
@@ -1303,7 +1744,8 @@ impl BlocksDal<'_, '_> {
                 data_availability.inclusion_data,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM
                 l1_batches
             LEFT JOIN commitments ON commitments.l1_batch_number = l1_batches.number
@@ -1321,8 +1763,11 @@ impl BlocksDal<'_, '_> {
             "#,
         )
         .instrument("get_last_committed_to_eth_l1_batch")
-        .fetch_one(self.storage)
+        .fetch_optional(self.storage)
         .await?;
+        let Some(batch) = batch else {
+            return Ok(None);
+        };
         // genesis batch is first generated without commitment, we should wait for the tree to set it.
         if batch.commitment.is_none() {
             return Ok(None);
@@ -1341,11 +1786,36 @@ impl BlocksDal<'_, '_> {
                 number
             FROM
                 l1_batches
+            WHERE
+                eth_commit_tx_id IS NOT NULL
+                AND commitment IS NOT NULL
+            ORDER BY
+                number DESC
+            LIMIT
+                1
+            "#
+        )
+        .instrument("get_number_of_last_l1_batch_committed_on_eth")
+        .fetch_optional(self.storage)
+        .await?
+        .map(|row| L1BatchNumber(row.number as u32)))
+    }
+
+    /// Returns the number of the last L1 batch for which an Ethereum commit tx was sent and confirmed.
+    pub async fn get_number_of_last_l1_batch_committed_finailized_on_eth(
+        &mut self,
+    ) -> DalResult<Option<L1BatchNumber>> {
+        Ok(sqlx::query!(
+            r#"
+            SELECT
+                number
+            FROM
+                l1_batches
             LEFT JOIN
                 eth_txs_history AS commit_tx
                 ON (l1_batches.eth_commit_tx_id = commit_tx.eth_tx_id)
             WHERE
-                commit_tx.confirmed_at IS NOT NULL
+                commit_tx.finality_status != 'pending'
             ORDER BY
                 number DESC
             LIMIT
@@ -1441,7 +1911,7 @@ impl BlocksDal<'_, '_> {
                 eth_txs_history AS execute_tx
                 ON (l1_batches.eth_execute_tx_id = execute_tx.eth_tx_id)
             WHERE
-                execute_tx.confirmed_at IS NOT NULL
+                execute_tx.finality_status = 'finalized'
             ORDER BY
                 number DESC
             LIMIT
@@ -1449,6 +1919,40 @@ impl BlocksDal<'_, '_> {
             "#
         )
         .instrument("get_number_of_last_l1_batch_executed_on_eth")
+        .fetch_optional(self.storage)
+        .await?
+        .map(|row| L1BatchNumber(row.number as u32)))
+    }
+
+    /// Returns the number of the last L1 batch for which an Ethereum commit tx exists in DB (may be unconfirmed)
+    pub async fn get_number_of_last_l1_batch_with_tx(
+        &mut self,
+        tx_type: L1BatchAggregatedActionType,
+    ) -> DalResult<Option<L1BatchNumber>> {
+        struct BlockNumberRow {
+            number: i64,
+        }
+        Ok(match_query_as!(
+            BlockNumberRow,
+            [r#"
+            SELECT
+                number
+            FROM
+                l1_batches
+            WHERE "#, 
+            _,
+            r#" ORDER BY
+                number DESC
+            LIMIT
+                1
+            "#],
+            match (tx_type) {
+                L1BatchAggregatedActionType::Commit => ("eth_commit_tx_id IS NOT NULL";),
+                L1BatchAggregatedActionType::PublishProofOnchain => ("eth_prove_tx_id IS NOT NULL";),
+                L1BatchAggregatedActionType::Execute => ("eth_execute_tx_id IS NOT NULL";),
+            }
+        )
+        .instrument("get_number_of_last_l1_batch_with_tx")
         .fetch_optional(self.storage)
         .await?
         .map(|row| L1BatchNumber(row.number as u32)))
@@ -1501,7 +2005,8 @@ impl BlocksDal<'_, '_> {
                 data_availability.inclusion_data,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM
                 l1_batches
             LEFT JOIN commitments ON commitments.l1_batch_number = l1_batches.number
@@ -1593,7 +2098,8 @@ impl BlocksDal<'_, '_> {
                 data_availability.inclusion_data,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM
                 (
                     SELECT
@@ -1676,7 +2182,8 @@ impl BlocksDal<'_, '_> {
                         data_availability.inclusion_data,
                         l1_gas_price,
                         l2_fair_gas_price,
-                        fair_pubdata_price
+                        fair_pubdata_price,
+                        pubdata_limit
                     FROM
                         l1_batches
                     LEFT JOIN commitments ON commitments.l1_batch_number = l1_batches.number
@@ -1848,7 +2355,8 @@ impl BlocksDal<'_, '_> {
                     data_availability.inclusion_data,
                     l1_gas_price,
                     l2_fair_gas_price,
-                    fair_pubdata_price
+                    fair_pubdata_price,
+                    pubdata_limit
                 FROM
                     l1_batches
                 LEFT JOIN commitments ON commitments.l1_batch_number = l1_batches.number
@@ -1924,7 +2432,8 @@ impl BlocksDal<'_, '_> {
                 data_availability.inclusion_data,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM
                 l1_batches
             LEFT JOIN commitments ON commitments.l1_batch_number = l1_batches.number
@@ -1973,8 +2482,8 @@ impl BlocksDal<'_, '_> {
         bootloader_hash: H256,
         default_aa_hash: H256,
         protocol_version_id: ProtocolVersionId,
-
         with_da_inclusion_info: bool,
+        send_precommit_txs: bool,
     ) -> anyhow::Result<Vec<L1BatchWithMetadata>> {
         let raw_batches = sqlx::query_as!(
             StorageL1Batch,
@@ -2014,7 +2523,8 @@ impl BlocksDal<'_, '_> {
                 data_availability.inclusion_data,
                 l1_gas_price,
                 l2_fair_gas_price,
-                fair_pubdata_price
+                fair_pubdata_price,
+                pubdata_limit
             FROM
                 l1_batches
             LEFT JOIN commitments ON commitments.l1_batch_number = l1_batches.number
@@ -2038,15 +2548,20 @@ impl BlocksDal<'_, '_> {
                     data_availability.inclusion_data IS NOT NULL
                     OR $4 IS FALSE
                 )
+                AND (
+                    final_precommit_eth_tx_id IS NOT NULL
+                    OR $5 IS FALSE
+                )
             ORDER BY
                 number
             LIMIT
-                $5
+                $6
             "#,
             bootloader_hash.as_bytes(),
             default_aa_hash.as_bytes(),
             protocol_version_id as i32,
             with_da_inclusion_info,
+            send_precommit_txs,
             limit as i64,
         )
         .instrument("get_ready_for_commit_l1_batches")
@@ -2201,6 +2716,38 @@ impl BlocksDal<'_, '_> {
         ))
     }
 
+    pub async fn get_batch_chain_merkle_path_until_msg_root(
+        &mut self,
+        number: L1BatchNumber,
+    ) -> DalResult<Option<BatchAndChainMerklePath>> {
+        let Some(row) = sqlx::query!(
+            r#"
+            SELECT
+                batch_chain_merkle_path_until_msg_root
+            FROM
+                l1_batches
+            WHERE
+                number = $1
+            "#,
+            i64::from(number.0)
+        )
+        .instrument("get_batch_chain_merkle_path_until_msg_root")
+        .with_arg("number", &number)
+        .fetch_optional(self.storage)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let Some(batch_chain_merkle_path_until_msg_root) =
+            row.batch_chain_merkle_path_until_msg_root
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            bincode::deserialize(&batch_chain_merkle_path_until_msg_root).unwrap(),
+        ))
+    }
+
     pub async fn get_l1_batch_pubdata_params(
         &mut self,
         number: L1BatchNumber,
@@ -2277,6 +2824,32 @@ impl BlocksDal<'_, '_> {
             &proof_bin
         )
         .instrument("set_batch_chain_merkle_path")
+        .with_arg("number", &number)
+        .execute(self.storage)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn set_batch_chain_merkle_path_until_msg_root(
+        &mut self,
+        number: L1BatchNumber,
+        proof: BatchAndChainMerklePath,
+    ) -> DalResult<()> {
+        let proof_bin = bincode::serialize(&proof).unwrap();
+        sqlx::query!(
+            r#"
+            UPDATE
+            l1_batches
+            SET
+                batch_chain_merkle_path_until_msg_root = $2
+            WHERE
+                number = $1
+            "#,
+            i64::from(number.0),
+            &proof_bin
+        )
+        .instrument("set_batch_chain_merkle_path_until_msg_root")
         .with_arg("number", &number)
         .execute(self.storage)
         .await?;
@@ -3040,6 +3613,28 @@ impl BlocksDal<'_, '_> {
 
         Ok(())
     }
+
+    pub async fn get_batch_number_of_prove_tx_id(
+        &mut self,
+        tx_id: u32,
+    ) -> DalResult<Option<L1BatchNumber>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                number
+            FROM
+                l1_batches
+            WHERE
+                eth_prove_tx_id = $1
+            "#,
+            tx_id as i32
+        )
+        .instrument("get_batch_number_of_prove_tx_id")
+        .fetch_optional(self.storage)
+        .await?;
+
+        Ok(row.map(|row| L1BatchNumber(row.number as u32)))
+    }
 }
 
 /// These methods should only be used for tests.
@@ -3071,7 +3666,7 @@ impl BlocksDal<'_, '_> {
 
     pub async fn insert_mock_l1_batch(&mut self, header: &L1BatchHeader) -> anyhow::Result<()> {
         self.insert_l1_batch(header.to_unsealed_header()).await?;
-        self.mark_l1_batch_as_sealed(header, &[], &[], &[], Default::default())
+        self.mark_l1_batch_as_sealed(header, &[], &[], &[], Default::default(), 1)
             .await
     }
 
@@ -3138,7 +3733,10 @@ impl BlocksDal<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use zksync_types::{tx::IncludedTxLocation, Address, ProtocolVersion};
+    use zksync_types::{
+        aggregated_operations::AggregatedActionType, tx::IncludedTxLocation, Address,
+        ProtocolVersion,
+    };
 
     use super::*;
     use crate::{
@@ -3146,12 +3744,15 @@ mod tests {
         ConnectionPool, Core, CoreDal,
     };
 
-    async fn save_mock_eth_tx(action_type: AggregatedActionType, conn: &mut Connection<'_, Core>) {
+    async fn save_mock_eth_tx(
+        action_type: L1BatchAggregatedActionType,
+        conn: &mut Connection<'_, Core>,
+    ) {
         conn.eth_sender_dal()
             .save_eth_tx(
                 1,
                 vec![],
-                action_type,
+                AggregatedActionType::L1Batch(action_type),
                 Address::default(),
                 Some(1),
                 None,
@@ -3194,66 +3795,66 @@ mod tests {
 
         insert_mock_l1_batch_header(&mut conn, &header).await;
 
-        save_mock_eth_tx(AggregatedActionType::Commit, &mut conn).await;
-        save_mock_eth_tx(AggregatedActionType::PublishProofOnchain, &mut conn).await;
-        save_mock_eth_tx(AggregatedActionType::Execute, &mut conn).await;
+        save_mock_eth_tx(L1BatchAggregatedActionType::Commit, &mut conn).await;
+        save_mock_eth_tx(L1BatchAggregatedActionType::PublishProofOnchain, &mut conn).await;
+        save_mock_eth_tx(L1BatchAggregatedActionType::Execute, &mut conn).await;
 
         assert!(conn
             .blocks_dal()
-            .set_eth_tx_id(
+            .set_eth_tx_id_for_l1_batches(
                 L1BatchNumber(1)..=L1BatchNumber(1),
                 1,
-                AggregatedActionType::Commit,
+                AggregatedActionType::L1Batch(L1BatchAggregatedActionType::Commit),
             )
             .await
             .is_ok());
 
         assert!(conn
             .blocks_dal()
-            .set_eth_tx_id(
+            .set_eth_tx_id_for_l1_batches(
                 L1BatchNumber(1)..=L1BatchNumber(1),
                 2,
-                AggregatedActionType::Commit,
+                AggregatedActionType::L1Batch(L1BatchAggregatedActionType::Commit),
             )
             .await
             .is_err());
 
         assert!(conn
             .blocks_dal()
-            .set_eth_tx_id(
+            .set_eth_tx_id_for_l1_batches(
                 L1BatchNumber(1)..=L1BatchNumber(1),
                 1,
-                AggregatedActionType::PublishProofOnchain,
+                AggregatedActionType::L1Batch(L1BatchAggregatedActionType::PublishProofOnchain),
             )
             .await
             .is_ok());
 
         assert!(conn
             .blocks_dal()
-            .set_eth_tx_id(
+            .set_eth_tx_id_for_l1_batches(
                 L1BatchNumber(1)..=L1BatchNumber(1),
                 2,
-                AggregatedActionType::PublishProofOnchain,
+                AggregatedActionType::L1Batch(L1BatchAggregatedActionType::PublishProofOnchain),
             )
             .await
             .is_err());
 
         assert!(conn
             .blocks_dal()
-            .set_eth_tx_id(
+            .set_eth_tx_id_for_l1_batches(
                 L1BatchNumber(1)..=L1BatchNumber(1),
                 1,
-                AggregatedActionType::Execute,
+                AggregatedActionType::L1Batch(L1BatchAggregatedActionType::Execute),
             )
             .await
             .is_ok());
 
         assert!(conn
             .blocks_dal()
-            .set_eth_tx_id(
+            .set_eth_tx_id_for_l1_batches(
                 L1BatchNumber(1)..=L1BatchNumber(1),
                 2,
-                AggregatedActionType::Execute,
+                AggregatedActionType::L1Batch(L1BatchAggregatedActionType::Execute),
             )
             .await
             .is_err());
